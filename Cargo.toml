@@ -1,0 +1,29 @@
+[package]
+name = "obolargus-server"
+version = "0.1.0"
+description = "Axum REST API backend for Obolargus"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+obolargus-core = { path = "../obolargus-core" }
+lx_engine = { path = "../lx_engine" }
+axum = "0.8"
+tokio.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros"] }
+jsonwebtoken = "9"
+argon2 = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+envconfig = "0.10"
+dotenvy = "0.15"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
