@@ -54,21 +54,19 @@ fn cors_origins(config: &AppConfig) -> Vec<HeaderValue> {
 /// boots without the database (see `contracts/health-check.md`).
 pub async fn connect_database(url: Option<&str>) -> Option<PgPool> {
     match url {
-        Some(url) => {
-            match sqlx::postgres::PgPoolOptions::new()
-                .acquire_timeout(std::time::Duration::from_secs(5))
-                .connect(url)
-                .await
-            {
-                Ok(pool) => Some(pool),
-                Err(error) => {
-                    tracing::warn!(
-                        "database connection failed at startup: {error}; continuing without database"
-                    );
-                    None
-                }
+        Some(url) => match sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(url)
+            .await
+        {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                tracing::warn!(
+                    "database connection failed at startup: {error}; continuing without database"
+                );
+                None
             }
-        }
+        },
         None => {
             tracing::info!("DATABASE_URL not set; running without database-backed features");
             None
