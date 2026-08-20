@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-obolargus-core = { path = "../obolargus-core" }
+obolargus-core = { path = "../obolargus_core" }
 lx_engine = { path = "../lx_engine" }
 axum = "0.8"
 tokio.workspace = true
