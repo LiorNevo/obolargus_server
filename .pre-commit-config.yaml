@@ -4,9 +4,20 @@ repos:
     hooks:
       - id: check-yaml
       - id: check-toml
+      - id: check-json
+        exclude: |
+          (?x)^(
+            .*settings.json
+          )$
       - id: check-added-large-files
         args: ["--maxkb=1024"]
+      - id: check-executables-have-shebangs
       - id: check-case-conflict
+      - id: check-shebang-scripts-are-executable
+        exclude: |
+          (?x)^(
+            .*\.rs
+          )$
       - id: check-merge-conflict
       - id: end-of-file-fixer
       - id: trailing-whitespace
