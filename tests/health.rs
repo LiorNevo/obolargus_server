@@ -11,20 +11,7 @@ use obolargus_server::config::AppConfig;
 use obolargus_server::{AppState, router};
 
 fn state_without_database() -> AppState {
-    AppState {
-        config: AppConfig {
-            host: "127.0.0.1".to_string(),
-            port: 8000,
-            rust_log: "info".to_string(),
-            database_url: String::new(),
-            jwt_secret: String::new(),
-            jwt_access_ttl_minutes: 15,
-            jwt_refresh_ttl_days: 7,
-            cors_allowed_origins: "http://127.0.0.1:8081".to_string(),
-            auth_enabled: false,
-        },
-        pool: None,
-    }
+    AppState::new(AppConfig::default(), None).expect("app state")
 }
 
 async fn body_text(response: axum::response::Response) -> String {

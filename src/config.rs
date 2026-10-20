@@ -3,10 +3,14 @@
 //! Every runtime value is read from the environment (with `dotenvy` support
 //! for a local `.env` file) and is never hardcoded. The variable names,
 //! defaults, and the fail-fast validation rule are specified in
-//! `specs/001-boilerplate-submodules/contracts/config-contract.md`.
+//! `specs/001-boilerplate-submodules/contracts/config-contract.md` and the
+//! market-data additions in
+//! `specs/017-yahoo-data-source/contracts/config-contract-additions.md`.
 
 use envconfig::Envconfig;
 use std::fmt;
+
+use obolargus_core::market_data::config::{DataSourceConfig, MarketDataConfig};
 
 /// Application configuration for the API server.
 #[derive(Debug, Clone, PartialEq, Eq, Envconfig)]
@@ -38,6 +42,64 @@ pub struct AppConfig {
     /// Enables JWT auth middleware. Requires a non-empty `JWT_SECRET`.
     #[envconfig(from = "AUTH_ENABLED", default = "false")]
     pub auth_enabled: bool,
+    /// Whether to spawn the scheduled-task loop on `serve()`. Off by
+    /// default so tests / CI can boot without scheduled work
+    /// (FR-030 + spec 017 US4).
+    #[envconfig(from = "RUN_SCHEDULED_TASKS", default = "false")]
+    pub run_scheduled_tasks: bool,
+    /// End-of-day refresh interval in seconds. Default 86400 (24 h).
+    /// Implements FR-030 of spec 017.
+    #[envconfig(from = "MARKET_DATA_EOD_INTERVAL_SECONDS", default = "86400")]
+    pub market_data_eod_interval_seconds: u64,
+    /// Reconciliation deferred flag. When `true`, `run_reconcile` is
+    /// opt-in via the API; the scheduled task does NOT trigger it
+    /// (FR-021 of spec 017).
+    #[envconfig(from = "MARKET_DATA_RECONCILE_DEFERRED", default = "true")]
+    pub market_data_reconcile_deferred: bool,
+    /// Reserved batch size for the parallel-batch follow-on. Sequential
+    /// in v1.
+    #[envconfig(from = "MARKET_DATA_REFRESH_BATCH_SIZE", default = "50")]
+    pub market_data_refresh_batch_size: u64,
+    /// JSON array of per-source configs. Default = single Yahoo source.
+    /// Implements FR-002 of spec 017.
+    #[envconfig(from = "MARKET_DATA_SOURCES", default = "[]")]
+    pub market_data_sources: String,
+    /// Yahoo Finance API key (optional in v1; reserved for premium tier).
+    #[envconfig(from = "YAHOO_FINANCE_API_KEY", default = "")]
+    pub yahoo_finance_api_key: String,
+    /// Yahoo Finance user-agent override.
+    #[envconfig(from = "YAHOO_FINANCE_USER_AGENT", default = "")]
+    pub yahoo_finance_user_agent: String,
+    /// Yahoo Finance upstream timeout in seconds.
+    #[envconfig(from = "YAHOO_FINANCE_TIMEOUT_SECONDS", default = "30")]
+    pub yahoo_finance_timeout_seconds: u64,
+}
+
+impl Default for AppConfig {
+    /// The default configuration, matching the `envconfig` defaults
+    /// declared on each field. Used by tests and by callers that build
+    /// an `AppConfig` programmatically.
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8000,
+            rust_log: "info".to_string(),
+            database_url: String::new(),
+            jwt_secret: String::new(),
+            jwt_access_ttl_minutes: 15,
+            jwt_refresh_ttl_days: 7,
+            cors_allowed_origins: "http://127.0.0.1:8081".to_string(),
+            auth_enabled: false,
+            run_scheduled_tasks: false,
+            market_data_eod_interval_seconds: 86_400,
+            market_data_reconcile_deferred: true,
+            market_data_refresh_batch_size: 50,
+            market_data_sources: "[]".to_string(),
+            yahoo_finance_api_key: String::new(),
+            yahoo_finance_user_agent: String::new(),
+            yahoo_finance_timeout_seconds: 30,
+        }
+    }
 }
 
 impl AppConfig {
@@ -69,10 +131,48 @@ impl AppConfig {
             .collect()
     }
 
+    /// Parses the `MARKET_DATA_SOURCES` JSON into typed configs.
+    pub fn market_data_config(&self) -> Result<MarketDataConfig, ConfigError> {
+        let sources_json = self.market_data_sources.trim();
+        let sources: Vec<DataSourceConfig> = if sources_json.is_empty() || sources_json == "[]" {
+            vec![DataSourceConfig::default_yahoo()]
+        } else {
+            serde_json::from_str(sources_json)
+                .map_err(|e| ConfigError::Load(format!("MARKET_DATA_SOURCES: {e}")))?
+        };
+        let config = MarketDataConfig {
+            sources,
+            eod_interval_seconds: self.market_data_eod_interval_seconds,
+            refresh_batch_size: self.market_data_refresh_batch_size,
+            reconcile_deferred: self.market_data_reconcile_deferred,
+            run_scheduled_tasks: self.run_scheduled_tasks,
+        };
+        config
+            .validate()
+            .map_err(|e| ConfigError::Load(format!("MARKET_DATA_SOURCES validation: {e}")))?;
+        Ok(config)
+    }
+
     /// Validates cross-field configuration rules.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.auth_enabled && self.jwt_secret.trim().is_empty() {
             return Err(ConfigError::MissingJwtSecret);
+        }
+        // Length-validate the optional API key per spec's v1 contract.
+        if !self.yahoo_finance_api_key.is_empty() {
+            let len = self.yahoo_finance_api_key.len();
+            if !(16..=256).contains(&len) {
+                return Err(ConfigError::Load(format!(
+                    "YAHOO_FINANCE_API_KEY length must be in 16..=256 (got {len})"
+                )));
+            }
+        }
+        // Bounds-check the timeout.
+        if !(1..=600).contains(&self.yahoo_finance_timeout_seconds) {
+            return Err(ConfigError::Load(format!(
+                "YAHOO_FINANCE_TIMEOUT_SECONDS must be in 1..=600 (got {})",
+                self.yahoo_finance_timeout_seconds
+            )));
         }
         Ok(())
     }
@@ -119,6 +219,9 @@ mod tests {
         assert_eq!(config.rust_log, "info");
         assert_eq!(config.database_url(), None);
         assert!(!config.auth_enabled);
+        assert!(!config.run_scheduled_tasks);
+        assert_eq!(config.market_data_eod_interval_seconds, 86_400);
+        assert!(config.market_data_reconcile_deferred);
     }
 
     #[test]
@@ -131,12 +234,17 @@ mod tests {
                 "CORS_ALLOWED_ORIGINS".to_string(),
                 "http://a, http://b".to_string(),
             ),
+            (
+                "MARKET_DATA_EOD_INTERVAL_SECONDS".to_string(),
+                "60".to_string(),
+            ),
         ]);
         let config = AppConfig::init_from_hashmap(&env).unwrap();
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 9000);
         assert_eq!(config.rust_log, "debug");
         assert_eq!(config.cors_origins(), vec!["http://a", "http://b"]);
+        assert_eq!(config.market_data_eod_interval_seconds, 60);
     }
 
     #[test]
@@ -172,5 +280,55 @@ mod tests {
         with_secret.auth_enabled = true;
         with_secret.jwt_secret = "s3cret".to_string();
         assert_eq!(with_secret.validate(), Ok(()));
+    }
+
+    #[test]
+    fn api_key_length_is_validated() {
+        let mut config = AppConfig::init_from_hashmap(&map()).unwrap();
+        config.yahoo_finance_api_key = "short".to_string();
+        assert!(config.validate().is_err());
+        config.yahoo_finance_api_key = "x".repeat(257);
+        assert!(config.validate().is_err());
+        config.yahoo_finance_api_key = "0123456789abcdef".to_string();
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn timeout_bounds_are_validated() {
+        let mut config = AppConfig::init_from_hashmap(&map()).unwrap();
+        config.yahoo_finance_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+        config.yahoo_finance_timeout_seconds = 60;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn market_data_config_default_is_valid() {
+        let app_config = AppConfig::init_from_hashmap(&map()).unwrap();
+        let market_data = app_config.market_data_config().expect("market_data config");
+        assert_eq!(market_data.sources.len(), 1);
+        assert_eq!(market_data.sources[0].source_id, "yahoo_finance");
+    }
+
+    #[test]
+    fn market_data_sources_invalid_json_fails_fast() {
+        let mut app_config = AppConfig::init_from_hashmap(&map()).unwrap();
+        app_config.market_data_sources = "not json".to_string();
+        let result = app_config.market_data_config();
+        assert!(matches!(
+            result,
+            Err(super::ConfigError::Load(ref msg)) if msg.contains("MARKET_DATA_SOURCES")
+        ));
+    }
+
+    #[test]
+    fn market_data_sources_with_duplicate_ids_validates_uniqueness() {
+        let json = r#"[{"source_id":"a","display_name":"A","provider_type":"yahoo_finance","enabled":true,"priority":1,"supported_schemes":["TICKER"]},{"source_id":"a","display_name":"A2","provider_type":"yahoo_finance","enabled":true,"priority":2,"supported_schemes":["TICKER"]}]"#;
+        let mut app_config = AppConfig::init_from_hashmap(&map()).unwrap();
+        app_config.market_data_sources = json.to_string();
+        let result = app_config.market_data_config();
+        assert!(
+            matches!(result, Err(super::ConfigError::Load(ref msg)) if msg.contains("duplicate"))
+        );
     }
 }
