@@ -588,3 +588,96 @@ async fn load_accepts_both_identifier_forms() {
     assert_eq!(pair_form.scheme, "TICKER:XNAS");
     assert_eq!(pair_form.value, "aapl");
 }
+
+// ---------------------------------------------------------------------------
+// `POST /api/market-data/load-range` — the ranged load (spec 018, FR-014)
+// ---------------------------------------------------------------------------
+
+/// Posts a range body and returns the response status and body text.
+async fn post_load_range(body: &str) -> (StatusCode, String) {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load-range")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_text(response).await)
+}
+
+/// A fully valid body degrades to 503 when no pool is configured.
+#[tokio::test]
+async fn load_range_without_a_database_pool_returns_503() {
+    let (status, text) = post_load_range(
+        r#"{"identifiers": ["TICKER:AAPL"], "from": "2026-10-01", "to": "2026-10-02"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(text.contains("no database pool configured"), "body: {text}");
+}
+
+/// An empty identifier list is rejected before the pool is consulted.
+#[tokio::test]
+async fn load_range_rejects_an_empty_identifier_list() {
+    let (status, text) =
+        post_load_range(r#"{"identifiers": [], "from": "2026-10-01", "to": "2026-10-02"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("identifier list is empty"), "body: {text}");
+}
+
+/// A reversed range is caller-input validation, not an empty success.
+#[tokio::test]
+async fn load_range_rejects_a_reversed_range() {
+    let (status, text) = post_load_range(
+        r#"{"identifiers": ["TICKER:AAPL"], "from": "2026-10-02", "to": "2026-10-01"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("later than range end"), "body: {text}");
+}
+
+/// A future end date is rejected before the pool is consulted.
+#[tokio::test]
+async fn load_range_rejects_a_future_end_date() {
+    let future = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let body =
+        format!(r#"{{"identifiers": ["TICKER:AAPL"], "from": "2026-10-01", "to": "{future}"}}"#);
+    let (status, text) = post_load_range(&body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("later than today"), "body: {text}");
+}
+
+/// A zero or oversized window is rejected.
+#[tokio::test]
+async fn load_range_rejects_an_invalid_window() {
+    for concurrency in [0, 33] {
+        let body = format!(
+            r#"{{"identifiers": ["TICKER:AAPL"], "from": "2026-10-01", "to": "2026-10-02", "concurrency": {concurrency}}}"#
+        );
+        let (status, text) = post_load_range(&body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("concurrency must be between"), "body: {text}");
+    }
+}
+
+/// An unparseable date is a caller-input validation failure.
+#[tokio::test]
+async fn load_range_rejects_an_unparseable_date() {
+    let (status, text) = post_load_range(
+        r#"{"identifiers": ["TICKER:AAPL"], "from": "10/01/2026", "to": "2026-10-02"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("not a valid YYYY-MM-DD date"), "body: {text}");
+}

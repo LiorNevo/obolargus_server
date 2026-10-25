@@ -23,6 +23,9 @@ use obolargus_core::market_data::error::MarketDataProviderError;
 use obolargus_core::market_data::load::{
     IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
 };
+use obolargus_core::market_data::load_range::{
+    IdentifierRangeLoadConfig, IdentifierRangeLoadReport, run_identifier_range_load,
+};
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
 };
@@ -290,6 +293,35 @@ pub struct LoadBody {
     /// for every identifier; the normal fail-over continues when it cannot
     /// answer.
     pub source: Option<String>,
+    /// Create an asset when an identifier resolves to none (FR-014).
+    #[serde(default)]
+    pub create_missing_assets: bool,
+}
+
+/// Body of `POST /api/market-data/load-range`.
+///
+/// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Deserialize)]
+pub struct LoadRangeBody {
+    /// The identifiers to load.
+    pub identifiers: Vec<IdentifierInput>,
+    /// First date to load, as `YYYY-MM-DD` (inclusive).
+    pub from: String,
+    /// Last date to load, as `YYYY-MM-DD` (inclusive).
+    pub to: String,
+    /// The size of the concurrency window (defaults to `4`).
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    /// The preferred upstream source id (optional).
+    pub source: Option<String>,
+    /// Create an asset when an identifier resolves to none.
+    #[serde(default)]
+    pub create_missing_assets: bool,
+}
+
+/// The default range window when the caller does not name one.
+fn default_concurrency() -> usize {
+    4
 }
 
 /// `POST /api/market-data/load` — load reference data for a batch of
@@ -358,6 +390,103 @@ pub async fn load(
             preferred_source: body.source,
             trigger: "api".to_string(),
             dry_run: false,
+            create_missing_assets: body.create_missing_assets,
+            default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY.to_string(),
+        },
+    )
+    .await
+    .map_err(|e| typed_error_to_http(&e))?;
+
+    Ok(Json(report))
+}
+
+/// `POST /api/market-data/load-range` — load reference data for a batch of
+/// identifiers over every calendar day in `from..=to`.
+///
+/// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
+pub async fn load_range(
+    State(state): State<AppState>,
+    Json(body): Json<LoadRangeBody>,
+) -> Result<Json<IdentifierRangeLoadReport>, (StatusCode, String)> {
+    let mut identifiers = Vec::with_capacity(body.identifiers.len());
+    for input in body.identifiers {
+        identifiers.push(
+            input
+                .into_identifier()
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("validation error: {e}")))?,
+        );
+    }
+    if identifiers.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "validation error: the identifier list is empty".to_string(),
+        ));
+    }
+
+    let from = chrono::NaiveDate::parse_from_str(body.from.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: '{}' is not a valid YYYY-MM-DD date",
+                body.from
+            ),
+        )
+    })?;
+    let to = chrono::NaiveDate::parse_from_str(body.to.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: '{}' is not a valid YYYY-MM-DD date",
+                body.to
+            ),
+        )
+    })?;
+
+    let today = chrono::Utc::now().date_naive();
+    if from > to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: range start {from} is later than range end {to}"),
+        ));
+    }
+    if to > today {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: as-of date {to} is later than today ({today})"),
+        ));
+    }
+    if body.concurrency == 0
+        || body.concurrency > obolargus_core::market_data::load_range::MAX_CONCURRENCY
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: concurrency must be between 1 and {}",
+                obolargus_core::market_data::load_range::MAX_CONCURRENCY
+            ),
+        ));
+    }
+
+    let pool = state.pool.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no database pool configured".to_string(),
+        )
+    })?;
+
+    let report = run_identifier_range_load(
+        Some(pool),
+        &state.market_data,
+        IdentifierRangeLoadConfig {
+            identifiers,
+            from,
+            to,
+            preferred_source: body.source,
+            trigger: "api".to_string(),
+            dry_run: false,
+            concurrency: body.concurrency,
+            create_missing_assets: body.create_missing_assets,
+            default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY.to_string(),
         },
     )
     .await
