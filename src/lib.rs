@@ -96,6 +96,7 @@ pub fn router(state: AppState) -> Router {
             "/api/market-data/reconcile",
             post(routes::market_data::reconcile),
         )
+        .route("/api/market-data/load", post(routes::market_data::load))
         .layer(CorsLayer::new().allow_origin(AllowOrigin::list(cors_origins(&state.config))))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

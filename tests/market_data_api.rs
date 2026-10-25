@@ -405,3 +405,186 @@ fn price_bar_payload_shape_is_stable() {
     }
     assert!(payload["close"].is_string(), "prices are decimal strings");
 }
+
+// ---------------------------------------------------------------------------
+// `POST /api/market-data/load` — the batch reference-data load (spec 018)
+// ---------------------------------------------------------------------------
+
+/// A valid load body reaches the operation; without a pool it degrades to
+/// a 503 like its sibling routes.
+#[tokio::test]
+async fn load_without_a_database_pool_returns_503() {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"identifiers": ["TICKER:AAPL"], "date": "2026-10-24"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = body_text(response).await;
+    assert!(text.contains("no database pool configured"), "body: {text}");
+}
+
+/// An empty identifier list is a caller-input validation failure.
+#[tokio::test]
+async fn load_rejects_an_empty_identifier_list() {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"identifiers": [], "date": "2026-10-24"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = body_text(response).await;
+    assert!(text.contains("identifier list is empty"), "body: {text}");
+}
+
+/// A malformed identifier string is a caller-input validation failure.
+#[tokio::test]
+async fn load_rejects_a_malformed_identifier() {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"identifiers": ["AAPL"], "date": "2026-10-24"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = body_text(response).await;
+    assert!(text.contains("validation error"), "body: {text}");
+}
+
+/// A future date is a caller-input validation failure.
+#[tokio::test]
+async fn load_rejects_a_future_date() {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"identifiers": ["TICKER:AAPL"], "date": "2099-01-01"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// An unparseable date is a caller-input validation failure.
+#[tokio::test]
+async fn load_rejects_an_unparseable_date() {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"identifiers": ["TICKER:AAPL"], "date": "not-a-date"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// An identifier object without a type is a caller-input validation failure.
+#[tokio::test]
+async fn load_rejects_an_identifier_without_a_type() {
+    let state = state_with(vec![LookupProvider {
+        source_id: "mock".to_string(),
+        hits: vec![],
+    }]);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"identifiers": [{"type": "", "value": "AAPL"}], "date": "2026-10-24"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = body_text(response).await;
+    assert!(text.contains("validation error"), "body: {text}");
+}
+
+/// The identifier input accepts both the string form and the explicit
+/// `{type, value}` form.
+#[tokio::test]
+async fn load_accepts_both_identifier_forms() {
+    use obolargus_server::routes::market_data::IdentifierInput;
+
+    let text_form = IdentifierInput::Text("TICKER:XNAS:AAPL".to_string())
+        .into_identifier()
+        .expect("text form");
+    assert_eq!(text_form.scheme, "TICKER:XNAS");
+    assert_eq!(text_form.value, "AAPL");
+
+    let pair_form = IdentifierInput::Pair {
+        identifier_type: "ticker:xnas".to_string(),
+        value: "aapl".to_string(),
+    }
+    .into_identifier()
+    .expect("pair form");
+    assert_eq!(pair_form.scheme, "TICKER:XNAS");
+    assert_eq!(pair_form.value, "aapl");
+}

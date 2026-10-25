@@ -5,6 +5,10 @@
 //! - `POST /api/market-data/refresh`    — on-demand refresh for one asset.
 //! - `GET  /api/market-data/lookup`     — ticker / company-name lookup.
 //! - `POST /api/market-data/reconcile`  — cross-source reconciliation.
+//!
+//! Plus the batch load surface of `specs/018-load-reference-data/spec.md`:
+//! - `POST /api/market-data/load`       — load reference data by identifier
+//!   and date, returning the execution report.
 
 #![forbid(unsafe_code)]
 
@@ -16,11 +20,14 @@ use uuid::Uuid;
 
 use obolargus_core::domain::id::DomainId;
 use obolargus_core::market_data::error::MarketDataProviderError;
+use obolargus_core::market_data::load::{
+    IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
+};
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
 };
 use obolargus_core::market_data::refresh::{RefreshConfig, run_refresh};
-use obolargus_core::market_data::types::TickerLookupRequest;
+use obolargus_core::market_data::types::{TickerLookupRequest, TypedIdentifier};
 
 use crate::AppState;
 
@@ -203,6 +210,159 @@ pub async fn reconcile(
         canonical_value: summary.canonical_value,
         sources_tried: summary.per_source_answers.len(),
     }))
+}
+
+/// One identifier in a load request.
+///
+/// Accepts either form the contract allows: the explicit object carrying
+/// the identifier's **type** and value, or the `TYPE:VALUE` string.
+///
+/// Implements FR-012 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum IdentifierInput {
+    /// The `TYPE:VALUE` string form.
+    Text(String),
+    /// The explicit `{ "type": …, "value": … }` form.
+    Pair {
+        /// The identifier's type (the stored `scheme`).
+        #[serde(rename = "type")]
+        identifier_type: String,
+        /// The identifier's value.
+        value: String,
+    },
+}
+
+impl IdentifierInput {
+    /// Converts the input into a typed identifier.
+    ///
+    /// The string form is parsed at the **last** colon; the object form's
+    /// `type` becomes the stored scheme.
+    ///
+    /// Implements FR-002 / FR-012 of `specs/018-load-reference-data/spec.md`.
+    pub fn into_identifier(self) -> Result<TypedIdentifier, String> {
+        match self {
+            IdentifierInput::Text(raw) => {
+                let trimmed = raw.trim();
+                let Some((scheme, value)) = trimmed.rsplit_once(':') else {
+                    return Err(format!(
+                        "identifier '{trimmed}' must be '<type>:<value>' or {{type, value}}"
+                    ));
+                };
+                let scheme = scheme.trim().to_uppercase();
+                let value = value.trim();
+                if scheme.is_empty() || value.is_empty() {
+                    return Err(format!(
+                        "identifier '{trimmed}' must carry a non-empty type and value"
+                    ));
+                }
+                Ok(TypedIdentifier::new(scheme, value))
+            }
+            IdentifierInput::Pair {
+                identifier_type,
+                value,
+            } => {
+                let scheme = identifier_type.trim().to_uppercase();
+                let value = value.trim();
+                if scheme.is_empty() || value.is_empty() {
+                    return Err("an identifier must carry a non-empty type and value".to_string());
+                }
+                Ok(TypedIdentifier::new(scheme, value))
+            }
+        }
+    }
+}
+
+/// The request body of `POST /api/market-data/load`.
+///
+/// Implements FR-012 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Deserialize)]
+pub struct LoadBody {
+    /// The identifiers to load.
+    pub identifiers: Vec<IdentifierInput>,
+    /// The single as-of date, as `YYYY-MM-DD`.
+    ///
+    /// Kept as a string so an unparseable date is reported as a
+    /// caller-input validation error (HTTP 400) rather than as the
+    /// extractor's own rejection.
+    pub date: String,
+    /// The preferred upstream source id (optional). It is consulted first
+    /// for every identifier; the normal fail-over continues when it cannot
+    /// answer.
+    pub source: Option<String>,
+}
+
+/// `POST /api/market-data/load` — load reference data for a batch of
+/// identifiers as of one date.
+///
+/// Per-identifier failures never produce a non-200 status: the report body
+/// is the outcome. Only caller-input validation (HTTP 400) and a missing
+/// pool (HTTP 503) produce an error status.
+///
+/// Implements FR-011 / FR-012 / FR-013 of
+/// `specs/018-load-reference-data/spec.md`.
+pub async fn load(
+    State(state): State<AppState>,
+    Json(body): Json<LoadBody>,
+) -> Result<Json<IdentifierLoadReport>, (StatusCode, String)> {
+    let mut identifiers = Vec::with_capacity(body.identifiers.len());
+    for input in body.identifiers {
+        identifiers.push(
+            input
+                .into_identifier()
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("validation error: {e}")))?,
+        );
+    }
+    if identifiers.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "validation error: the identifier list is empty".to_string(),
+        ));
+    }
+
+    let as_of_date =
+        chrono::NaiveDate::parse_from_str(body.date.trim(), "%Y-%m-%d").map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "validation error: '{}' is not a valid YYYY-MM-DD date",
+                    body.date
+                ),
+            )
+        })?;
+
+    // A date in the future is caller-input validation, checked before the
+    // pool so the answer does not depend on whether a database is
+    // configured.
+    let today = chrono::Utc::now().date_naive();
+    if as_of_date > today {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: as-of date {as_of_date} is later than today ({today})"),
+        ));
+    }
+
+    let pool = state.pool.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no database pool configured".to_string(),
+        )
+    })?;
+
+    let report = run_identifier_load(
+        pool,
+        &state.market_data,
+        IdentifierLoadConfig {
+            identifiers,
+            as_of_date,
+            preferred_source: body.source,
+            trigger: "api".to_string(),
+        },
+    )
+    .await
+    .map_err(|e| typed_error_to_http(&e))?;
+
+    Ok(Json(report))
 }
 
 /// Maps a typed provider error onto an HTTP status code and message.
