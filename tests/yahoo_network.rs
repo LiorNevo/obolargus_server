@@ -28,7 +28,9 @@
 use obolargus_core::market_data::config::DataSourceConfig;
 use obolargus_core::market_data::error::MarketDataProviderError;
 use obolargus_core::market_data::trait_::MarketDataProvider;
-use obolargus_core::market_data::types::{LatestBarRequest, TickerLookupRequest, TypedIdentifier};
+use obolargus_core::market_data::types::{
+    HistoricalRangeRequest, LatestBarRequest, TickerLookupRequest, TypedIdentifier,
+};
 use obolargus_server::market_data_provider::yahoo::YahooFinanceProvider;
 
 /// The ticker symbols the network-gated tests exercise by default.
@@ -213,4 +215,74 @@ fn the_symbol_override_accepts_a_comma_separated_list() {
     assert_eq!(parse_symbol_list("AAPL,,BX"), vec!["AAPL", "BX"]);
     assert!(parse_symbol_list("").is_empty());
     assert!(parse_symbol_list("  ,  ").is_empty());
+}
+
+/// The one-day range request returns that day's session (spec 018's
+/// dependency on the upstream's range semantics, research D3).
+///
+/// The load asks for the range "that date to that date" and expects the
+/// source to answer with that session's bar. This is the live proof of
+/// that assumption; it is `#[ignore]`d like the other network-gated cases.
+#[test]
+fn yahoo_provider_network_gated_one_day_range_returns_that_session() {
+    let symbols = test_symbols();
+    if symbols.is_empty() {
+        eprintln!("SKIPPED: no symbols to test");
+        return;
+    }
+    let provider = provider();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut failures: Vec<String> = Vec::new();
+
+    for symbol in &symbols {
+        // A recent weekday; the upstream answers with the last session it
+        // carries when the requested day has none.
+        // A recent **weekday**: the upstream carries no quotes for a
+        // weekend, and an empty answer there would say nothing about the
+        // range semantics this test checks.
+        let date = most_recent_weekday(chrono::Utc::now().date_naive() - chrono::Duration::days(7));
+        let outcome = rt.block_on(async {
+            provider
+                .get_historical_range(HistoricalRangeRequest {
+                    identifier: TypedIdentifier::new("TICKER", symbol),
+                    from: date,
+                    to: date,
+                })
+                .await
+        });
+        match outcome {
+            Ok(range) => {
+                let in_window = range.bars.iter().all(|bar| bar.as_of_date == date);
+                if in_window {
+                    println!("  {symbol}: ok — {} bar(s) within {date}", range.bars.len());
+                } else {
+                    failures.push(format!(
+                        "{symbol}: the one-day range answered with a bar outside {date}"
+                    ));
+                }
+            }
+            Err(MarketDataProviderError::NotFound(message)) => {
+                println!("  {symbol}: skipped — no session for that date ({message})");
+            }
+            Err(error) => failures.push(format!("{symbol}: {error}")),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} symbols failed the live one-day-range check:\n  - {}",
+        failures.len(),
+        symbols.len(),
+        failures.join("\n  - ")
+    );
+}
+
+/// The most recent weekday on or before `date`.
+fn most_recent_weekday(date: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let mut candidate = date;
+    while candidate.weekday().num_days_from_monday() >= 5 {
+        candidate -= chrono::Duration::days(1);
+    }
+    candidate
 }

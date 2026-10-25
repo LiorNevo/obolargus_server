@@ -350,13 +350,14 @@ pub async fn load(
     })?;
 
     let report = run_identifier_load(
-        pool,
+        Some(pool),
         &state.market_data,
         IdentifierLoadConfig {
             identifiers,
             as_of_date,
             preferred_source: body.source,
             trigger: "api".to_string(),
+            dry_run: false,
         },
     )
     .await
