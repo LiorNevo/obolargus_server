@@ -125,7 +125,21 @@ pub async fn connect_database(url: Option<&str>) -> Option<PgPool> {
             .connect(url)
             .await
         {
-            Ok(pool) => Some(pool),
+            Ok(pool) => {
+                // Apply any pending migrations before the first request can
+                // reach a missing table. `sqlx` tracks applied versions in
+                // `_sqlx_migrations`, so an up-to-date database is untouched
+                // and only the pending, additive migrations run.
+                match obolargus_core::bin_helpers::run_migrations(&pool).await {
+                    Ok(()) => Some(pool),
+                    Err(error) => {
+                        tracing::error!(
+                            "database migration failed at startup: {error}; running without database"
+                        );
+                        None
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     "database connection failed at startup: {error}; continuing without database"

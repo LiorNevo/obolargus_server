@@ -681,3 +681,32 @@ async fn load_range_rejects_an_unparseable_date() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(text.contains("not a valid YYYY-MM-DD date"), "body: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// Migration bootstrap (2026-10-25)
+// ---------------------------------------------------------------------------
+
+/// Starting the server against a reachable database applies pending
+/// migrations before any request can reach a missing table.
+#[tokio::test]
+async fn connect_database_applies_pending_migrations() {
+    let Some(url) = std::env::var("TEST_DATABASE_URL")
+        .ok()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+    else {
+        eprintln!("SKIPPED: no test database configured");
+        return;
+    };
+
+    let Some(pool) = obolargus_server::connect_database(Some(&url)).await else {
+        eprintln!("SKIPPED: could not connect to the test database");
+        return;
+    };
+
+    let (exists,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('public.reference_data_load_runs') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+    assert!(exists, "the migrated schema must include the 018 table");
+}
