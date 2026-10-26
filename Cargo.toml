@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-obolargus-core = { path = "../obolargus_core" }
+obolargus-core = { path = "../obolargus_core", features = ["openapi"] }
 lx_engine = { path = "../lx_engine" }
 axum = "0.8.9"
 tokio.workspace = true
@@ -31,8 +31,13 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 time = "0.3"
 async-trait = "0.1"
 rust_decimal.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
 wiremock = "0.6"
+flate2 = "1"
+oas3 = "0.22"

@@ -30,25 +30,34 @@ use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
 };
 use obolargus_core::market_data::refresh::{RefreshConfig, run_refresh};
+use obolargus_core::market_data::registry::SourceDescriptor;
 use obolargus_core::market_data::types::{TickerLookupRequest, TypedIdentifier};
 
 use crate::AppState;
 
 /// `GET /api/market-data/sources` — return every configured source.
-pub async fn list_sources(
-    State(state): State<AppState>,
-) -> Json<Vec<obolargus_core::market_data::registry::SourceDescriptor>> {
+#[utoipa::path(
+    get,
+    path = "/api/market-data/sources",
+    tag = "market-data",
+    summary = "List configured market-data sources",
+    description = "Returns every configured source with its enabled flag, priority and supported identifier schemes.",
+    responses(
+        (status = 200, description = "The configured market-data sources", body = Vec<SourceDescriptor>)
+    )
+)]
+pub async fn list_sources(State(state): State<AppState>) -> Json<Vec<SourceDescriptor>> {
     Json(state.market_data.enumerate_sources())
 }
 
 /// `POST /api/market-data/refresh` — on-demand refresh for one asset.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct RefreshBody {
     /// Asset id (UUID) to refresh.
     pub asset_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RefreshResponse {
     /// Run id of the persisted audit row.
     pub run_id: Uuid,
@@ -64,6 +73,24 @@ pub struct RefreshResponse {
     pub assets_source_unavailable: i64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/market-data/refresh",
+    tag = "market-data",
+    summary = "Refresh one asset on demand",
+    description = "Fetches and stores the latest reference data for one asset, returning the run summary.",
+    request_body = RefreshBody,
+    responses(
+        (status = 200, description = "The refresh run summary", body = RefreshResponse),
+        (status = 400, description = "Invalid request", body = String, content_type = "text/plain"),
+        (status = 401, description = "The provider rejected the credentials", body = String, content_type = "text/plain"),
+        (status = 415, description = "Missing or unsupported JSON content type", body = String, content_type = "text/plain"),
+        (status = 422, description = "The JSON body does not match the required shape", body = String, content_type = "text/plain"),
+        (status = 500, description = "Unexpected server error", body = String, content_type = "text/plain"),
+        (status = 502, description = "Provider unavailable, rate-limited or infrastructure failure", body = String, content_type = "text/plain"),
+        (status = 503, description = "No database pool is configured", body = String, content_type = "text/plain")
+    )
+)]
 pub async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshBody>,
@@ -96,14 +123,14 @@ pub async fn refresh(
 }
 
 /// The `q` query parameter for `GET /api/market-data/lookup`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct LookupQuery {
     /// The free-text query (ticker or company-name fragment).
     pub q: String,
 }
 
 /// One source's lookup result.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct LookupResponse {
     /// The hits this source returned.
     pub hits: Vec<obolargus_core::market_data::types::TickerLookupHit>,
@@ -116,6 +143,20 @@ pub struct LookupResponse {
 /// Aggregates the hits from every enabled source into one list, sorted by
 /// relevance descending then symbol ascending (the tie-breaker). No asset
 /// or identifier row is created — the look-up is read-only (FR-012).
+#[utoipa::path(
+    get,
+    path = "/api/market-data/lookup",
+    tag = "market-data",
+    summary = "Look up tickers or company names",
+    description = "Aggregates lookup hits from every enabled source, sorted by relevance then symbol. Read-only; creates no asset or identifier rows.",
+    params(
+        ("q" = String, Query, description = "Free-text ticker or company-name query; must be non-empty", example = "AAPL")
+    ),
+    responses(
+        (status = 200, description = "Lookup hits grouped by answering source", body = Vec<LookupResponse>),
+        (status = 400, description = "The query is missing or empty", body = String, content_type = "text/plain")
+    )
+)]
 pub async fn lookup(
     State(state): State<AppState>,
     Query(query): Query<LookupQuery>,
@@ -154,21 +195,46 @@ pub async fn lookup(
 }
 
 /// `POST /api/market-data/reconcile` — cross-source reconciliation (opt-in per FR-021).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReconcileBody {
+    /// Asset id (UUID) to reconcile.
     pub asset_id: Uuid,
+    /// Reference-data fact type to reconcile.
     pub fact_type: String,
+    /// The as-of date, as an ISO date (`YYYY-MM-DD`).
     pub as_of_date: chrono::NaiveDate,
+    /// Reconciliation policy: `primary_wins` or `first_non_empty`.
     pub policy: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ReconcileResponse {
+    /// The persisted reconciliation id.
     pub reconciliation_id: Uuid,
+    /// The canonical value selected by the policy.
     pub canonical_value: String,
+    /// Number of sources consulted.
     pub sources_tried: usize,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/market-data/reconcile",
+    tag = "market-data",
+    summary = "Reconcile reference data across sources",
+    description = "Selects a canonical value for one asset/fact/date using the named policy. `majority` is deferred and returns a client error.",
+    request_body = ReconcileBody,
+    responses(
+        (status = 200, description = "The reconciliation result", body = ReconcileResponse),
+        (status = 400, description = "Invalid policy or request", body = String, content_type = "text/plain"),
+        (status = 401, description = "The provider rejected the credentials", body = String, content_type = "text/plain"),
+        (status = 415, description = "Missing or unsupported JSON content type", body = String, content_type = "text/plain"),
+        (status = 422, description = "The JSON body does not match the required shape", body = String, content_type = "text/plain"),
+        (status = 500, description = "Unexpected server error", body = String, content_type = "text/plain"),
+        (status = 502, description = "Provider unavailable, rate-limited or infrastructure failure", body = String, content_type = "text/plain"),
+        (status = 503, description = "No database pool is configured", body = String, content_type = "text/plain")
+    )
+)]
 pub async fn reconcile(
     State(state): State<AppState>,
     Json(body): Json<ReconcileBody>,
@@ -221,7 +287,7 @@ pub async fn reconcile(
 /// the identifier's **type** and value, or the `TYPE:VALUE` string.
 ///
 /// Implements FR-012 of `specs/018-load-reference-data/spec.md`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum IdentifierInput {
     /// The `TYPE:VALUE` string form.
@@ -279,7 +345,7 @@ impl IdentifierInput {
 /// The request body of `POST /api/market-data/load`.
 ///
 /// Implements FR-012 of `specs/018-load-reference-data/spec.md`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct LoadBody {
     /// The identifiers to load.
     pub identifiers: Vec<IdentifierInput>,
@@ -301,7 +367,7 @@ pub struct LoadBody {
 /// Body of `POST /api/market-data/load-range`.
 ///
 /// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct LoadRangeBody {
     /// The identifiers to load.
     pub identifiers: Vec<IdentifierInput>,
@@ -333,6 +399,24 @@ fn default_concurrency() -> usize {
 ///
 /// Implements FR-011 / FR-012 / FR-013 of
 /// `specs/018-load-reference-data/spec.md`.
+#[utoipa::path(
+    post,
+    path = "/api/market-data/load",
+    tag = "market-data",
+    summary = "Load reference data for a batch of identifiers as of one date",
+    description = "Loads reference data for unique identifiers and stores each value dual-temporally. Per-identifier failures are reported in the 200 execution report; only caller-input validation and infrastructure failures produce non-200 statuses.",
+    request_body = LoadBody,
+    responses(
+        (status = 200, description = "The batch execution report (per-identifier failures are reported here)", body = IdentifierLoadReport),
+        (status = 400, description = "Invalid identifier, date or empty identifier list", body = String, content_type = "text/plain"),
+        (status = 401, description = "The provider rejected the credentials", body = String, content_type = "text/plain"),
+        (status = 415, description = "Missing or unsupported JSON content type", body = String, content_type = "text/plain"),
+        (status = 422, description = "The JSON body does not match the required shape", body = String, content_type = "text/plain"),
+        (status = 500, description = "Unexpected server error", body = String, content_type = "text/plain"),
+        (status = 502, description = "Provider unavailable, rate-limited or infrastructure failure", body = String, content_type = "text/plain"),
+        (status = 503, description = "No database pool is configured", body = String, content_type = "text/plain")
+    )
+)]
 pub async fn load(
     State(state): State<AppState>,
     Json(body): Json<LoadBody>,
@@ -404,6 +488,24 @@ pub async fn load(
 /// identifiers over every calendar day in `from..=to`.
 ///
 /// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
+#[utoipa::path(
+    post,
+    path = "/api/market-data/load-range",
+    tag = "market-data",
+    summary = "Load reference data for a date range",
+    description = "Fans the single-date load out over every calendar day in from..=to with a bounded concurrency window. Per-identifier and per-date failures are reported in the 200 range report; only caller-input validation and infrastructure failures produce non-200 statuses.",
+    request_body = LoadRangeBody,
+    responses(
+        (status = 200, description = "The range execution report (per-identifier failures are reported here)", body = IdentifierRangeLoadReport),
+        (status = 400, description = "Invalid identifier, date, range or concurrency", body = String, content_type = "text/plain"),
+        (status = 401, description = "The provider rejected the credentials", body = String, content_type = "text/plain"),
+        (status = 415, description = "Missing or unsupported JSON content type", body = String, content_type = "text/plain"),
+        (status = 422, description = "The JSON body does not match the required shape", body = String, content_type = "text/plain"),
+        (status = 500, description = "Unexpected server error", body = String, content_type = "text/plain"),
+        (status = 502, description = "Provider unavailable, rate-limited or infrastructure failure", body = String, content_type = "text/plain"),
+        (status = 503, description = "No database pool is configured", body = String, content_type = "text/plain")
+    )
+)]
 pub async fn load_range(
     State(state): State<AppState>,
     Json(body): Json<LoadRangeBody>,

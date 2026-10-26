@@ -18,6 +18,14 @@ Operational rules for contributors and AI agents working in this crate.
 - Config behavior must honor `contracts/config-contract.md` (`AUTH_ENABLED`
   without `JWT_SECRET` fails fast).
 - Wire behavior is covered by integration tests; keep the boot test green.
+- Every public API route MUST be registered through `api_router()` with
+  `utoipa_axum::routes!(...)`. Do not add API endpoints with a plain
+  `Router::route`; that would omit them from the OpenAPI document. The
+  documentation and redirect routes in `docs.rs` are the only exempt
+  surfaces.
+- Keep documentation URLs mount-relative (`../api-docs/openapi.json`,
+  `servers: [{ "url": ".." }]`); never introduce absolute `http://` URLs or
+  internal host/port values into the document or page.
 
 ## Commands
 

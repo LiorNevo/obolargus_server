@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use crate::AppState;
 
 /// Health check response body.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct HealthResponse {
     status: &'static str,
     version: &'static str,
@@ -22,6 +22,17 @@ pub struct HealthResponse {
 /// Reports the service as `ok`. The `database` field is present only when a
 /// pool is configured; a failed ping still returns HTTP 200 with
 /// `database: "unavailable"` per the contract.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    summary = "Service health check",
+    description = "Reports service status and, when a database is configured, \
+                   whether the database is reachable.",
+    responses(
+        (status = 200, description = "The service is healthy", body = HealthResponse)
+    )
+)]
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",

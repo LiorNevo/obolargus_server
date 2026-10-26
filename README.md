@@ -10,8 +10,26 @@ repository. Design: `specs/architecture/`; feature: `specs/001-boilerplate-submo
   fail-fast validation per `contracts/config-contract.md`.
 - `routes/health.rs` — `GET /health` → `{status, version, [database]}` per
   `contracts/health-check.md`.
-- `lib.rs` — `AppState`, `router()`, `connect_database()`, `serve()`.
+- `lib.rs` — `AppState`, `api_router()`, `openapi_document()`, `router()`,
+  `connect_database()`, `serve()`.
+- `docs.rs` — interactive Swagger UI, OpenAPI JSON document and the `/` →
+  `/swagger-ui/` redirect.
 - `main.rs` — fail-fast config load, tracing init, bind and serve.
+
+## API documentation
+
+Generated from the handler/type annotations (Constitution XI) and served
+without a database:
+
+- `http://127.0.0.1:8000/swagger-ui/` — interactive Swagger UI with
+  "Try it out".
+- `http://127.0.0.1:8000/api-docs/openapi.json` — OpenAPI 3.1 document.
+- `http://127.0.0.1:8000/` — `307` redirect to `/swagger-ui/`.
+
+Through the develop gateway (`make develop`), open
+`http://127.0.0.1:8080/obolargus/api`; it redirects to the mounted page at
+`/obolargus/api/swagger-ui/`. Documentation URLs are mount-relative, so
+"Try it out" works both on port 8000 and through the gateway.
 
 ## Development
 

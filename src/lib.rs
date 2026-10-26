@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod docs;
 pub mod market_data_provider;
 pub mod routes;
 pub mod tasks;
@@ -75,35 +76,64 @@ impl AppState {
     }
 }
 
-/// Builds the API [`Router`] with tracing and CORS middleware.
+/// Builds the API [`Router`] with tracing and CORS middleware and the
+/// interactive OpenAPI documentation surfaces.
 pub fn router(state: AppState) -> Router {
-    use axum::routing::{get, post};
     use tower_http::cors::{AllowOrigin, CorsLayer};
     use tower_http::trace::TraceLayer;
 
-    Router::new()
-        .route("/health", get(routes::health::health))
-        .route(
-            "/api/market-data/sources",
-            get(routes::market_data::list_sources),
-        )
-        .route(
-            "/api/market-data/refresh",
-            post(routes::market_data::refresh),
-        )
-        .route("/api/market-data/lookup", get(routes::market_data::lookup))
-        .route(
-            "/api/market-data/reconcile",
-            post(routes::market_data::reconcile),
-        )
-        .route("/api/market-data/load", post(routes::market_data::load))
-        .route(
-            "/api/market-data/load-range",
-            post(routes::market_data::load_range),
-        )
+    let (api_router, document) = api_router().split_for_parts();
+    let document = with_document_metadata(document);
+
+    api_router
+        .merge(docs::swagger_routes(document))
         .layer(CorsLayer::new().allow_origin(AllowOrigin::list(cors_origins(&state.config))))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Builds the public API router and collects its OpenAPI operations.
+///
+/// Every public API endpoint MUST be registered here with [`routes!`] so the
+/// served route and its OpenAPI description are produced by the same call.
+/// Documentation and redirect routes live in [`docs`] and are intentionally
+/// excluded from the operation inventory.
+pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
+    use utoipa_axum::{router::OpenApiRouter, routes};
+
+    OpenApiRouter::new()
+        .routes(routes!(routes::health::health))
+        .routes(routes!(routes::market_data::list_sources))
+        .routes(routes!(routes::market_data::refresh))
+        .routes(routes!(routes::market_data::lookup))
+        .routes(routes!(routes::market_data::reconcile))
+        .routes(routes!(routes::market_data::load))
+        .routes(routes!(routes::market_data::load_range))
+}
+
+/// Returns the OpenAPI 3.1 document generated from [`api_router`].
+///
+/// The document uses a mount-relative server URL (`..`) so "Try it out"
+/// requests resolve to the host and mount that served the document: the
+/// server root when accessed directly, or `/obolargus/api/` through the
+/// gateway.
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    let (_, document) = api_router().split_for_parts();
+    with_document_metadata(document)
+}
+
+/// Applies the public service metadata and mount-relative server URL.
+fn with_document_metadata(mut document: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
+    use utoipa::openapi::server::Server;
+
+    document.info.title = "Obolargus API".to_string();
+    document.info.version = env!("CARGO_PKG_VERSION").to_string();
+    document.info.description = Some(
+        "REST API for Obolargus. Interactive documentation: [Swagger UI](/swagger-ui/)."
+            .to_string(),
+    );
+    document.servers = Some(vec![Server::new("..")]);
+    document
 }
 
 fn cors_origins(config: &AppConfig) -> Vec<HeaderValue> {
