@@ -21,6 +21,22 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/market-data/reconcile"),
     ("post", "/api/market-data/load"),
     ("post", "/api/market-data/load-range"),
+    (
+        "get",
+        "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
+    ),
+    (
+        "post",
+        "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
+    ),
+    (
+        "post",
+        "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",
+    ),
+    (
+        "get",
+        "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
+    ),
 ];
 
 fn document() -> Value {
@@ -106,8 +122,8 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
         let tags = operation["tags"].as_array().expect("operation tags");
         assert!(
             tags.iter()
-                .any(|tag| tag == "health" || tag == "market-data"),
-            "{method} {path} must carry a health or market-data tag"
+                .any(|tag| tag == "health" || tag == "market-data" || tag == "temporal"),
+            "{method} {path} must carry a health, market-data, or temporal tag"
         );
         assert!(
             operation["summary"]
@@ -120,6 +136,33 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
             .as_object()
             .expect("operation responses");
         let statuses: BTreeSet<&str> = responses.keys().map(String::as_str).collect();
+
+        // The temporal surface documents a JSON error envelope and uses the
+        // contract's status set, which differs from the market-data surface.
+        if path.starts_with("/api/domain/") {
+            let expected: BTreeSet<&str> = match *method {
+                "get" if path.ends_with("/history") => ["200", "404"].into_iter().collect(),
+                "get" => ["200", "400", "404", "410"].into_iter().collect(),
+                _ if path.ends_with("/retract") => ["201", "409"].into_iter().collect(),
+                _ => ["201", "400", "409"].into_iter().collect(),
+            };
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            let success = if *method == "get" { "200" } else { "201" };
+            assert!(
+                responses[success]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON success body"
+            );
+            for status in expected.iter().filter(|status| **status != success) {
+                assert!(
+                    responses[*status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON error envelope"
+                );
+            }
+            continue;
+        }
 
         let expected: BTreeSet<&str> = match (*method, *path) {
             ("get", "/health") | ("get", "/api/market-data/sources") => {

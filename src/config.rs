@@ -73,6 +73,32 @@ pub struct AppConfig {
     /// Yahoo Finance upstream timeout in seconds.
     #[envconfig(from = "YAHOO_FINANCE_TIMEOUT_SECONDS", default = "30")]
     pub yahoo_finance_timeout_seconds: u64,
+
+    // ---- Temporal / intraday additions (spec 021) ----
+    /// Reject observations whose valid time exceeds now by more than this.
+    #[envconfig(from = "OBO_TEMPORAL_FUTURE_TOLERANCE_SECONDS", default = "300")]
+    pub temporal_future_tolerance_seconds: u64,
+    /// Polling cadence for intraday bars.
+    #[envconfig(from = "OBO_TEMPORAL_INGEST_INTERVAL_SECONDS", default = "60")]
+    pub temporal_ingest_interval_seconds: u64,
+    /// Maximum in-flight fetch/storage tasks.
+    #[envconfig(from = "OBO_TEMPORAL_INGEST_CONCURRENCY", default = "4")]
+    pub temporal_ingest_concurrency: u32,
+    /// Bounded queue size before backpressure is surfaced.
+    #[envconfig(from = "OBO_TEMPORAL_INGEST_MAX_QUEUE", default = "10000")]
+    pub temporal_ingest_max_queue: u32,
+    /// Partitions created ahead of now.
+    #[envconfig(from = "OBO_TEMPORAL_PARTITION_AHEAD_MONTHS", default = "2")]
+    pub temporal_partition_ahead_months: u32,
+    /// Default full-resolution retention window, in days.
+    #[envconfig(from = "OBO_TEMPORAL_RETENTION_INTRADAY_DAYS", default = "90")]
+    pub temporal_retention_intraday_days: u32,
+    /// Default archive threshold, in days.
+    #[envconfig(from = "OBO_TEMPORAL_RETENTION_ARCHIVE_DAYS", default = "365")]
+    pub temporal_retention_archive_days: u32,
+    /// `priority` | `named` | `first_non_empty`.
+    #[envconfig(from = "OBO_TEMPORAL_PRICE_SOURCE_POLICY", default = "priority")]
+    pub temporal_price_source_policy: String,
 }
 
 impl Default for AppConfig {
@@ -98,6 +124,14 @@ impl Default for AppConfig {
             yahoo_finance_api_key: String::new(),
             yahoo_finance_user_agent: String::new(),
             yahoo_finance_timeout_seconds: 30,
+            temporal_future_tolerance_seconds: 300,
+            temporal_ingest_interval_seconds: 60,
+            temporal_ingest_concurrency: 4,
+            temporal_ingest_max_queue: 10_000,
+            temporal_partition_ahead_months: 2,
+            temporal_retention_intraday_days: 90,
+            temporal_retention_archive_days: 365,
+            temporal_price_source_policy: "priority".to_string(),
         }
     }
 }
@@ -172,6 +206,60 @@ impl AppConfig {
             return Err(ConfigError::Load(format!(
                 "YAHOO_FINANCE_TIMEOUT_SECONDS must be in 1..=600 (got {})",
                 self.yahoo_finance_timeout_seconds
+            )));
+        }
+        self.validate_temporal()?;
+        Ok(())
+    }
+}
+
+impl AppConfig {
+    /// Fail-fast validation for the spec-021 keys.
+    ///
+    /// A zero interval, concurrency, or queue would either spin or drop
+    /// data, so none of them is accepted.
+    pub fn validate_temporal(&self) -> Result<(), ConfigError> {
+        if self.temporal_future_tolerance_seconds > 86_400 {
+            return Err(ConfigError::Load(format!(
+                "OBO_TEMPORAL_FUTURE_TOLERANCE_SECONDS must be <= 86400 (got {})",
+                self.temporal_future_tolerance_seconds
+            )));
+        }
+        if self.temporal_ingest_interval_seconds == 0 {
+            return Err(ConfigError::Load(
+                "OBO_TEMPORAL_INGEST_INTERVAL_SECONDS must be >= 1".to_string(),
+            ));
+        }
+        if !(1..=1024).contains(&self.temporal_ingest_concurrency) {
+            return Err(ConfigError::Load(format!(
+                "OBO_TEMPORAL_INGEST_CONCURRENCY must be in 1..=1024 (got {})",
+                self.temporal_ingest_concurrency
+            )));
+        }
+        if self.temporal_ingest_max_queue == 0 {
+            return Err(ConfigError::Load(
+                "OBO_TEMPORAL_INGEST_MAX_QUEUE must be >= 1".to_string(),
+            ));
+        }
+        if self.temporal_partition_ahead_months > 120 {
+            return Err(ConfigError::Load(format!(
+                "OBO_TEMPORAL_PARTITION_AHEAD_MONTHS must be <= 120 (got {})",
+                self.temporal_partition_ahead_months
+            )));
+        }
+        if self.temporal_retention_archive_days < self.temporal_retention_intraday_days {
+            return Err(ConfigError::Load(format!(
+                "OBO_TEMPORAL_RETENTION_ARCHIVE_DAYS ({}) must be >= OBO_TEMPORAL_RETENTION_INTRADAY_DAYS ({})",
+                self.temporal_retention_archive_days, self.temporal_retention_intraday_days
+            )));
+        }
+        if !matches!(
+            self.temporal_price_source_policy.as_str(),
+            "priority" | "named" | "first_non_empty"
+        ) {
+            return Err(ConfigError::Load(format!(
+                "OBO_TEMPORAL_PRICE_SOURCE_POLICY must be one of priority|named|first_non_empty (got {:?})",
+                self.temporal_price_source_policy
             )));
         }
         Ok(())
@@ -330,5 +418,66 @@ mod tests {
         assert!(
             matches!(result, Err(super::ConfigError::Load(ref msg)) if msg.contains("duplicate"))
         );
+    }
+
+    #[test]
+    fn temporal_defaults_match_the_contract() {
+        let config = AppConfig::init_from_hashmap(&map()).unwrap();
+        assert_eq!(config.temporal_future_tolerance_seconds, 300);
+        assert_eq!(config.temporal_ingest_interval_seconds, 60);
+        assert_eq!(config.temporal_ingest_concurrency, 4);
+        assert_eq!(config.temporal_ingest_max_queue, 10_000);
+        assert_eq!(config.temporal_partition_ahead_months, 2);
+        assert_eq!(config.temporal_retention_intraday_days, 90);
+        assert_eq!(config.temporal_retention_archive_days, 365);
+        assert_eq!(config.temporal_price_source_policy, "priority");
+        config.validate_temporal().expect("defaults are valid");
+    }
+
+    #[test]
+    fn temporal_validation_rejects_zero_and_inverted_values() {
+        let base = AppConfig::default();
+
+        let mut zero_interval = base.clone();
+        zero_interval.temporal_ingest_interval_seconds = 0;
+        assert!(zero_interval.validate_temporal().is_err());
+
+        let mut zero_concurrency = base.clone();
+        zero_concurrency.temporal_ingest_concurrency = 0;
+        assert!(zero_concurrency.validate_temporal().is_err());
+
+        let mut zero_queue = base.clone();
+        zero_queue.temporal_ingest_max_queue = 0;
+        assert!(zero_queue.validate_temporal().is_err());
+
+        let mut inverted = base.clone();
+        inverted.temporal_retention_intraday_days = 400;
+        inverted.temporal_retention_archive_days = 90;
+        assert!(inverted.validate_temporal().is_err());
+
+        let mut bad_policy = base.clone();
+        bad_policy.temporal_price_source_policy = "loudest".to_string();
+        assert!(bad_policy.validate_temporal().is_err());
+
+        let mut absurd_tolerance = base;
+        absurd_tolerance.temporal_future_tolerance_seconds = 86_401;
+        assert!(absurd_tolerance.validate_temporal().is_err());
+    }
+
+    #[test]
+    fn temporal_keys_accept_environment_overrides() {
+        let env = HashMap::from([
+            (
+                "OBO_TEMPORAL_INGEST_CONCURRENCY".to_string(),
+                "8".to_string(),
+            ),
+            (
+                "OBO_TEMPORAL_PRICE_SOURCE_POLICY".to_string(),
+                "named".to_string(),
+            ),
+        ]);
+        let config = AppConfig::init_from_hashmap(&env).unwrap();
+        assert_eq!(config.temporal_ingest_concurrency, 8);
+        assert_eq!(config.temporal_price_source_policy, "named");
     }
 }

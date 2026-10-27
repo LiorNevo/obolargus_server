@@ -57,7 +57,7 @@ async fn swagger_ui_uses_a_mount_relative_specification_url() {
 }
 
 #[tokio::test]
-async fn openapi_document_is_served_as_json_with_seven_paths() {
+async fn openapi_document_is_served_as_json_with_every_registered_path() {
     let response = assert_status(get("/api-docs/openapi.json").await, StatusCode::OK);
 
     let content_type = response
@@ -77,12 +77,28 @@ async fn openapi_document_is_served_as_json_with_seven_paths() {
     assert_eq!(document["info"]["title"], "Obolargus API");
     assert_eq!(document["servers"], serde_json::json!([{ "url": ".." }]));
 
-    let paths = document["paths"].as_object().expect("paths object");
+    let mut paths: Vec<&str> = document["paths"]
+        .as_object()
+        .expect("paths object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    paths.sort_unstable();
     assert_eq!(
-        paths.len(),
-        7,
-        "expected seven documented paths, got {:?}",
-        paths.keys().collect::<Vec<_>>()
+        paths,
+        [
+            "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
+            "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
+            "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",
+            "/api/market-data/load",
+            "/api/market-data/load-range",
+            "/api/market-data/lookup",
+            "/api/market-data/reconcile",
+            "/api/market-data/refresh",
+            "/api/market-data/sources",
+            "/health",
+        ],
+        "the served document must list every registered path"
     );
 }
 

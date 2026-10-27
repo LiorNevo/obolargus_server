@@ -109,6 +109,10 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::market_data::reconcile))
         .routes(routes!(routes::market_data::load))
         .routes(routes!(routes::market_data::load_range))
+        .routes(routes!(routes::temporal::get_fact))
+        .routes(routes!(routes::temporal::append_fact_handler))
+        .routes(routes!(routes::temporal::retract_fact_handler))
+        .routes(routes!(routes::temporal::fact_history_handler))
 }
 
 /// Returns the OpenAPI 3.1 document generated from [`api_router`].
