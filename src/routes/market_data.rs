@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use obolargus_core::domain::id::DomainId;
+use obolargus_core::market_data::audit::LoadRunContext;
+use obolargus_core::market_data::data_domain::DataDomain;
 use obolargus_core::market_data::error::MarketDataProviderError;
 use obolargus_core::market_data::load::{
-    IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
+    IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load_with_snapshot,
 };
 use obolargus_core::market_data::load_range::{
-    IdentifierRangeLoadConfig, IdentifierRangeLoadReport, run_identifier_range_load,
+    IdentifierRangeLoadConfig, IdentifierRangeLoadReport, run_identifier_range_load_with_group,
 };
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
@@ -362,6 +364,9 @@ pub struct LoadBody {
     /// Create an asset when an identifier resolves to none (FR-014).
     #[serde(default)]
     pub create_missing_assets: bool,
+    /// Data domain (defaults to `market_data`).
+    #[serde(default)]
+    pub data_domain: Option<String>,
 }
 
 /// Body of `POST /api/market-data/load-range`.
@@ -383,11 +388,38 @@ pub struct LoadRangeBody {
     /// Create an asset when an identifier resolves to none.
     #[serde(default)]
     pub create_missing_assets: bool,
+    /// Data domain (defaults to `market_data`).
+    #[serde(default)]
+    pub data_domain: Option<String>,
+    /// Client-generated group id for progress polling.
+    #[serde(default)]
+    pub client_group_id: Option<String>,
 }
 
 /// The default range window when the caller does not name one.
 fn default_concurrency() -> usize {
     4
+}
+
+/// Parses and validates the optional data domain.
+fn parse_data_domain(value: &Option<String>) -> Result<DataDomain, (StatusCode, String)> {
+    let raw = value.as_deref().unwrap_or("market_data");
+    let domain = raw.parse::<DataDomain>().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("validation error: {error}"),
+        )
+    })?;
+    if !domain.is_loadable() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: domain '{raw}' is not loadable: {}",
+                domain.unavailable_reason().unwrap_or("not available")
+            ),
+        ));
+    }
+    Ok(domain)
 }
 
 /// `POST /api/market-data/load` — load reference data for a batch of
@@ -446,6 +478,7 @@ pub async fn load(
                 ),
             )
         })?;
+    let data_domain = parse_data_domain(&body.data_domain)?;
 
     // A date in the future is caller-input validation, checked before the
     // pool so the answer does not depend on whether a database is
@@ -465,9 +498,10 @@ pub async fn load(
         )
     })?;
 
-    let report = run_identifier_load(
+    let snapshot = state.market_data.snapshot();
+    let report = run_identifier_load_with_snapshot(
         Some(pool),
-        &state.market_data,
+        &snapshot,
         IdentifierLoadConfig {
             identifiers,
             as_of_date,
@@ -476,6 +510,14 @@ pub async fn load(
             dry_run: false,
             create_missing_assets: body.create_missing_assets,
             default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY.to_string(),
+        },
+        &LoadRunContext {
+            data_domain,
+            as_of_date: Some(as_of_date),
+            range_group_id: None,
+            range_from: None,
+            range_to: None,
+            range_concurrency: None,
         },
     )
     .await
@@ -543,6 +585,16 @@ pub async fn load_range(
             ),
         )
     })?;
+    let data_domain = parse_data_domain(&body.data_domain)?;
+    let group_id = match body.client_group_id.as_deref() {
+        Some(raw) => Uuid::parse_str(raw.trim()).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("validation error: '{raw}' is not a valid group id"),
+            )
+        })?,
+        None => Uuid::new_v4(),
+    };
 
     let today = chrono::Utc::now().date_naive();
     if from > to {
@@ -576,7 +628,29 @@ pub async fn load_range(
         )
     })?;
 
-    let report = run_identifier_range_load(
+    let conflict: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM reference_data_load_runs
+            WHERE id = $1 OR range_group_id = $1
+         )",
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("group id check failed: {e}"),
+        )
+    })?;
+    if conflict {
+        return Err((
+            StatusCode::CONFLICT,
+            "group_id_conflict: the client group id is already in use".to_string(),
+        ));
+    }
+
+    let report = run_identifier_range_load_with_group(
         Some(pool),
         &state.market_data,
         IdentifierRangeLoadConfig {
@@ -590,6 +664,8 @@ pub async fn load_range(
             create_missing_assets: body.create_missing_assets,
             default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY.to_string(),
         },
+        group_id,
+        data_domain,
     )
     .await
     .map_err(|e| typed_error_to_http(&e))?;

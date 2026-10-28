@@ -74,9 +74,6 @@ pub fn build_registry_from_config(
         Arc<dyn obolargus_core::market_data::trait_::MarketDataProvider + Send + Sync>,
     > = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
-        if !source.enabled {
-            continue;
-        }
         let provider = build_provider_from_config(source)?;
         providers.push(provider);
     }
@@ -86,6 +83,11 @@ pub fn build_registry_from_config(
 
 /// Builds the registry and persists the configured sources into the
 /// `data_sources` table.
+///
+/// Every configured source is built (including config-disabled ones) so it
+/// can be enabled without a restart. The persisted `enabled` column is the
+/// authority after the first insert; the configuration's flag is only the
+/// initial value.
 ///
 /// The `data_sources` table records the configuration *shape* — never the
 /// credential value (FR-040). Fails if the registry cannot be built or the
@@ -97,21 +99,29 @@ pub async fn build_registry_and_persist(
     let mut providers: Vec<
         Arc<dyn obolargus_core::market_data::trait_::MarketDataProvider + Send + Sync>,
     > = Vec::with_capacity(config.sources.len());
+    let mut persisted_states: Vec<(String, bool)> = Vec::with_capacity(config.sources.len());
+
     for source in &config.sources {
         let (provider, api_key_present) =
             crate::market_data_provider::build_provider_with_key_presence(source)?;
-        if let Some(pool) = pool {
-            obolargus_core::market_data::data_sources::upsert_data_source(
+        let enabled = if let Some(pool) = pool {
+            let row = obolargus_core::market_data::data_sources::upsert_data_source(
                 pool,
                 source,
                 api_key_present,
             )
             .await?;
-        }
-        if source.enabled {
-            providers.push(provider);
-        }
+            row.enabled
+        } else {
+            source.enabled
+        };
+        persisted_states.push((source.source_id.clone(), enabled));
+        providers.push(provider);
     }
+
     let registry = DataSourceRegistry::new(providers)?;
+    for (source_id, enabled) in persisted_states {
+        registry.set_enabled(&source_id, enabled)?;
+    }
     Ok(Arc::new(registry))
 }

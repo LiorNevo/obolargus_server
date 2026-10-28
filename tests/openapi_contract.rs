@@ -21,6 +21,12 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/market-data/reconcile"),
     ("post", "/api/market-data/load"),
     ("post", "/api/market-data/load-range"),
+    ("get", "/api/data-load/domains"),
+    ("get", "/api/data-load/sources"),
+    ("patch", "/api/data-load/sources/{source_id}"),
+    ("get", "/api/data-load/history"),
+    ("get", "/api/data-load/history/{entry_id}"),
+    ("get", "/api/data-load/history/groups/{group_id}/progress"),
     (
         "get",
         "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
@@ -121,9 +127,11 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
 
         let tags = operation["tags"].as_array().expect("operation tags");
         assert!(
-            tags.iter()
-                .any(|tag| tag == "health" || tag == "market-data" || tag == "temporal"),
-            "{method} {path} must carry a health, market-data, or temporal tag"
+            tags.iter().any(|tag| tag == "health"
+                || tag == "market-data"
+                || tag == "temporal"
+                || tag == "data-load"),
+            "{method} {path} must carry a health, market-data, temporal, or data-load tag"
         );
         assert!(
             operation["summary"]
@@ -136,6 +144,40 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
             .as_object()
             .expect("operation responses");
         let statuses: BTreeSet<&str> = responses.keys().map(String::as_str).collect();
+
+        // The Data Load surface uses a JSON error envelope and its own status
+        // set, distinct from the legacy market-data text/plain surface.
+        if path.starts_with("/api/data-load/") {
+            let expected: BTreeSet<&str> = match (*method, *path) {
+                ("get", "/api/data-load/domains") => ["200"].into_iter().collect(),
+                ("get", "/api/data-load/sources") => ["200", "400"].into_iter().collect(),
+                ("patch", "/api/data-load/sources/{source_id}") => {
+                    ["200", "400", "404", "409", "500", "503"]
+                        .into_iter()
+                        .collect()
+                }
+                ("get", "/api/data-load/history") => ["200", "400", "503"].into_iter().collect(),
+                ("get", "/api/data-load/history/{entry_id}") => {
+                    ["200", "400", "404", "503"].into_iter().collect()
+                }
+                _ => ["200", "400", "503"].into_iter().collect(),
+            };
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            assert!(
+                responses["200"]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON success body"
+            );
+            for status in expected.iter().filter(|status| **status != "200") {
+                assert!(
+                    responses[*status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON error envelope"
+                );
+            }
+            continue;
+        }
 
         // The temporal surface documents a JSON error envelope and uses the
         // contract's status set, which differs from the market-data surface.

@@ -99,6 +99,11 @@ pub struct AppConfig {
     /// `priority` | `named` | `first_non_empty`.
     #[envconfig(from = "OBO_TEMPORAL_PRICE_SOURCE_POLICY", default = "priority")]
     pub temporal_price_source_policy: String,
+
+    // ---- Data Load page (spec 022) ----
+    /// A running history entry older than this is labelled incomplete.
+    #[envconfig(from = "DATA_LOAD_STALE_AFTER_SECONDS", default = "7200")]
+    pub data_load_stale_after_seconds: i64,
 }
 
 impl Default for AppConfig {
@@ -132,6 +137,7 @@ impl Default for AppConfig {
             temporal_retention_intraday_days: 90,
             temporal_retention_archive_days: 365,
             temporal_price_source_policy: "priority".to_string(),
+            data_load_stale_after_seconds: 7_200,
         }
     }
 }
@@ -209,6 +215,11 @@ impl AppConfig {
             )));
         }
         self.validate_temporal()?;
+        if self.data_load_stale_after_seconds <= 0 {
+            return Err(ConfigError::Load(
+                "DATA_LOAD_STALE_AFTER_SECONDS must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 }

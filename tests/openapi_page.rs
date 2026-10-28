@@ -87,6 +87,12 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
     assert_eq!(
         paths,
         [
+            "/api/data-load/domains",
+            "/api/data-load/history",
+            "/api/data-load/history/groups/{group_id}/progress",
+            "/api/data-load/history/{entry_id}",
+            "/api/data-load/sources",
+            "/api/data-load/sources/{source_id}",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",
