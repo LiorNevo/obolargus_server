@@ -94,7 +94,7 @@ pub fn router(state: AppState) -> Router {
 
 /// Builds the public API router and collects its OpenAPI operations.
 ///
-/// Every public API endpoint MUST be registered here with [`routes!`] so the
+/// Every public API endpoint MUST be registered here with [`utoipa_axum::routes!`] so the
 /// served route and its OpenAPI description are produced by the same call.
 /// Documentation and redirect routes live in [`docs`] and are intentionally
 /// excluded from the operation inventory.
