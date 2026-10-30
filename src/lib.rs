@@ -103,6 +103,7 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
 
     OpenApiRouter::new()
         .routes(routes!(routes::health::health))
+        .routes(routes!(routes::assets::search_assets))
         .routes(routes!(routes::market_data::list_sources))
         .routes(routes!(routes::market_data::refresh))
         .routes(routes!(routes::market_data::lookup))
@@ -119,6 +120,7 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::temporal::append_fact_handler))
         .routes(routes!(routes::temporal::retract_fact_handler))
         .routes(routes!(routes::temporal::fact_history_handler))
+        .routes(routes!(routes::temporal::fact_series_handler))
 }
 
 /// Returns the OpenAPI 3.1 document generated from [`api_router`].

@@ -87,6 +87,7 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
     assert_eq!(
         paths,
         [
+            "/api/assets",
             "/api/data-load/domains",
             "/api/data-load/history",
             "/api/data-load/history/groups/{group_id}/progress",
@@ -96,6 +97,7 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",
+            "/api/domain/{subject}/{subject_id}/facts/{fact_type}/series",
             "/api/market-data/load",
             "/api/market-data/load-range",
             "/api/market-data/lookup",

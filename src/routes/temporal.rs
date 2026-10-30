@@ -16,12 +16,17 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use obolargus_core::temporal::facts::read::{fact_as_known, fact_at, fact_history};
+use obolargus_core::temporal::facts::read::{
+    fact_as_known, fact_at, fact_history, fact_series_page,
+};
 use obolargus_core::temporal::facts::write::{append_fact, revoke_fact};
-use obolargus_core::temporal::{FactPoint, FactSubject, KnownAt, TemporalError, ValidAt};
+use obolargus_core::temporal::{
+    FactPoint, FactSubject, KnownAt, TemporalError, TemporalWindow, ValidAt,
+};
 
 use crate::AppState;
 
@@ -56,8 +61,14 @@ impl FactPointBody {
             subject_id: point.subject.id(),
             id: point.id,
             fact_type: point.fact_type.clone(),
-            valid_at: point.valid_at.to_string(),
-            known_at: point.known_at.to_string(),
+            valid_at: point
+                .valid_at
+                .as_datetime()
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            known_at: point
+                .known_at
+                .as_datetime()
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
             value: point.value.clone(),
             source: point.source.clone(),
             retracted: point.retracted,
@@ -371,6 +382,177 @@ pub async fn fact_history_handler(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
+        Err(error) => error_response(&error),
+    }
+}
+
+/// Query for the resolved series.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct SeriesQuery {
+    /// Inclusive lower valid-time bound (RFC 3339 or `YYYY-MM-DD`).
+    pub from: String,
+    /// Exclusive upper valid-time bound (RFC 3339 or `YYYY-MM-DD`).
+    pub to: String,
+    /// Transaction-time cutoff; omit for latest knowledge.
+    pub known_at: Option<String>,
+    /// Page size, 1..=20000; defaults to 5000.
+    pub limit: Option<u32>,
+    /// Opaque continuation token from `next_cursor`.
+    pub cursor: Option<String>,
+}
+
+/// Page coverage metadata.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SeriesCoverage {
+    /// Number of points in this page.
+    pub points: usize,
+    /// First point's valid time, or `null`.
+    pub first: Option<String>,
+    /// Last point's valid time, or `null`.
+    pub last: Option<String>,
+}
+
+/// The resolved-series response.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SeriesResponse {
+    /// Subject kind (`asset`, `issuer`, `portfolio`).
+    pub subject: String,
+    /// Subject id.
+    pub subject_id: Uuid,
+    /// Fact type.
+    pub fact_type: String,
+    /// Echoed as-known cutoff, or `null`.
+    pub known_at: Option<String>,
+    /// Resolved points for this page.
+    pub points: Vec<FactPointBody>,
+    /// Page coverage.
+    pub coverage: SeriesCoverage,
+    /// Cursor for the next page, or `null` when complete.
+    pub next_cursor: Option<String>,
+}
+
+fn series_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ErrorEnvelope {
+            error: ErrorBody {
+                code: code.to_string(),
+                message: message.into(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /api/domain/{subject}/{subject_id}/facts/{fact_type}/series`.
+#[utoipa::path(
+    get,
+    path = "/api/domain/{subject}/{subject_id}/facts/{fact_type}/series",
+    tag = "temporal",
+    summary = "Read a resolved bitemporal series",
+    params(
+        ("subject" = String, Path, description = "assets | issuers | portfolios"),
+        ("subject_id" = Uuid, Path),
+        ("fact_type" = String, Path),
+        SeriesQuery
+    ),
+    responses(
+        (status = 200, description = "Resolved points and coverage", body = SeriesResponse),
+        (status = 400, description = "invalid_time, invalid_limit, or invalid_cursor", body = ErrorEnvelope),
+        (status = 404, description = "unknown_subject", body = ErrorEnvelope),
+        (status = 500, description = "infrastructure", body = ErrorEnvelope)
+    )
+)]
+pub async fn fact_series_handler(
+    State(state): State<AppState>,
+    Path((subject, subject_id, fact_type)): Path<(String, Uuid, String)>,
+    Query(query): Query<SeriesQuery>,
+) -> Response {
+    let subject = match subject_from_path(&subject, subject_id) {
+        Ok(subject) => subject,
+        Err(error) => return error_response(&error),
+    };
+    let limit = query.limit.unwrap_or(5_000);
+    if limit == 0 || limit > 20_000 {
+        return series_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be between 1 and 20000.",
+        );
+    }
+    let after = match query.cursor.as_deref() {
+        Some(raw) => match parse_valid(raw) {
+            Ok(instant) => Some(instant),
+            Err(_) => {
+                return series_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cursor",
+                    "The cursor is not a valid RFC 3339 instant.",
+                );
+            }
+        },
+        None => None,
+    };
+    let window = match (parse_valid(&query.from), parse_valid(&query.to)) {
+        (Ok(from), Ok(to)) => match TemporalWindow::new(from, to) {
+            Ok(window) => window,
+            Err(error) => return error_response(&error),
+        },
+        (Err(error), _) | (_, Err(error)) => return error_response(&error),
+    };
+    let known_at = match query.known_at.as_deref() {
+        Some(raw) => match parse_known(raw) {
+            Ok(instant) => Some(instant),
+            Err(error) => return error_response(&error),
+        },
+        None => None,
+    };
+    let Some(pool) = state.pool.as_ref() else {
+        return series_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "infrastructure",
+            "The series read is unavailable without a database.",
+        );
+    };
+    match fact_series_page(pool, subject, &fact_type, window, known_at, after, limit).await {
+        Ok(page) => {
+            let first = page.points.first().map(|point| {
+                point
+                    .valid_at
+                    .as_datetime()
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+            });
+            let last = page.points.last().map(|point| {
+                point
+                    .valid_at
+                    .as_datetime()
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+            });
+            let next_cursor = if page.has_more {
+                page.points.last().map(|point| {
+                    point
+                        .valid_at
+                        .as_datetime()
+                        .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+                })
+            } else {
+                None
+            };
+            Json(SeriesResponse {
+                subject: subject.subject_name().to_string(),
+                subject_id,
+                fact_type,
+                known_at: query.known_at,
+                coverage: SeriesCoverage {
+                    points: page.points.len(),
+                    first,
+                    last,
+                },
+                points: page.points.iter().map(FactPointBody::from_point).collect(),
+                next_cursor,
+            })
+            .into_response()
+        }
         Err(error) => error_response(&error),
     }
 }

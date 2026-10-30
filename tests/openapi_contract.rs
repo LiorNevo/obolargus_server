@@ -15,6 +15,7 @@ use obolargus_server::openapi_document;
 /// are intentionally excluded.
 const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/health"),
+    ("get", "/api/assets"),
     ("get", "/api/market-data/sources"),
     ("post", "/api/market-data/refresh"),
     ("get", "/api/market-data/lookup"),
@@ -42,6 +43,10 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     (
         "get",
         "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
+    ),
+    (
+        "get",
+        "/api/domain/{subject}/{subject_id}/facts/{fact_type}/series",
     ),
 ];
 
@@ -130,6 +135,7 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
             tags.iter().any(|tag| tag == "health"
                 || tag == "market-data"
                 || tag == "temporal"
+                || tag == "domain"
                 || tag == "data-load"),
             "{method} {path} must carry a health, market-data, temporal, or data-load tag"
         );
@@ -144,6 +150,22 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
             .as_object()
             .expect("operation responses");
         let statuses: BTreeSet<&str> = responses.keys().map(String::as_str).collect();
+
+        // Asset search is an additive JSON read with its own status set.
+        if *path == "/api/assets" {
+            let expected: BTreeSet<&str> = ["200", "400", "500"].into_iter().collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            for status in &expected {
+                assert!(
+                    responses[*status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON body"
+                );
+            }
+            continue;
+        }
 
         // The Data Load surface uses a JSON error envelope and its own status
         // set, distinct from the legacy market-data text/plain surface.
@@ -184,6 +206,9 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
         if path.starts_with("/api/domain/") {
             let expected: BTreeSet<&str> = match *method {
                 "get" if path.ends_with("/history") => ["200", "404"].into_iter().collect(),
+                "get" if path.ends_with("/series") => {
+                    ["200", "400", "404", "500"].into_iter().collect()
+                }
                 "get" => ["200", "400", "404", "410"].into_iter().collect(),
                 _ if path.ends_with("/retract") => ["201", "409"].into_iter().collect(),
                 _ => ["201", "400", "409"].into_iter().collect(),

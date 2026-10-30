@@ -448,3 +448,102 @@ async fn temporal_handlers_need_a_database_pool() {
         assert_eq!(error_code(&body).await, "infrastructure");
     }
 }
+
+#[tokio::test]
+async fn series_returns_resolved_points_and_pages() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let asset = seed_asset(&pool).await;
+    let app = app(Some(pool.clone()));
+
+    for day in ["2026-01-02", "2026-01-05", "2026-01-06"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/domain/assets/{asset}/facts/market_price"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "valid_at": day,
+                    "known_at": "2026-01-07T12:00:00Z",
+                    "value": "{\"close\":\"1.00\"}",
+                    "source": "test"
+                })
+                .to_string(),
+            ))
+            .expect("request");
+        let (status, _) = send(&app, request).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let request = Request::builder()
+        .uri(format!(
+            "/api/domain/assets/{asset}/facts/market_price/series?from=2026-01-01&to=2026-02-01&limit=2"
+        ))
+        .body(Body::empty())
+        .expect("request");
+    let (status, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["points"].as_array().expect("points").len(), 2);
+    assert_eq!(json["coverage"]["points"], 2);
+    let valid_at = json["points"][0]["valid_at"].as_str().expect("valid_at");
+    assert!(
+        valid_at.contains('T') && valid_at.ends_with('Z'),
+        "{valid_at}"
+    );
+    assert!(json["next_cursor"].is_string());
+
+    let cursor = json["next_cursor"].as_str().expect("cursor");
+    let request = Request::builder()
+        .uri(format!(
+            "/api/domain/assets/{asset}/facts/market_price/series?from=2026-01-01&to=2026-02-01&limit=2&cursor={cursor}"
+        ))
+        .body(Body::empty())
+        .expect("request");
+    let (status, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["points"].as_array().expect("points").len(), 1);
+    assert!(json["next_cursor"].is_null());
+
+    drop_asset(&pool, asset).await;
+}
+
+#[tokio::test]
+async fn series_rejects_bad_windows_limits_and_cursors() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let asset = seed_asset(&pool).await;
+    let app = app(Some(pool.clone()));
+
+    for (query, code) in [
+        ("from=2026-02-01&to=2026-01-01", "invalid_time"),
+        ("from=2026-01-01&to=2026-02-01&limit=0", "invalid_limit"),
+        (
+            "from=2026-01-01&to=2026-02-01&cursor=garbage",
+            "invalid_cursor",
+        ),
+    ] {
+        let request = Request::builder()
+            .uri(format!(
+                "/api/domain/assets/{asset}/facts/market_price/series?{query}"
+            ))
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = send(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["code"], code);
+    }
+
+    let request = Request::builder()
+        .uri("/api/domain/widgets/6f1c2a8e-4b7a-4f0e-9b1f-2c3d4e5f6a7b/facts/market_price/series?from=2026-01-01&to=2026-02-01")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _) = send(&app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    drop_asset(&pool, asset).await;
+}
