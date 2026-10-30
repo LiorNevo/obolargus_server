@@ -547,3 +547,57 @@ async fn series_rejects_bad_windows_limits_and_cursors() {
 
     drop_asset(&pool, asset).await;
 }
+
+#[tokio::test]
+async fn series_validation_and_missing_pool_do_not_need_a_database() {
+    let app = app(None);
+    let base = format!(
+        "/api/domain/assets/{}/facts/market_price/series",
+        Uuid::from_u128(7)
+    );
+
+    for (query, code) in [
+        ("from=2026-02-01&to=2026-01-01", "invalid_time"),
+        ("from=2026-01-01&to=2026-02-01&limit=0", "invalid_limit"),
+        (
+            "from=2026-01-01&to=2026-02-01&cursor=garbage",
+            "invalid_cursor",
+        ),
+    ] {
+        let (status, body) = send(
+            &app,
+            Request::builder()
+                .uri(format!("{base}?{query}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(&body).await, code);
+    }
+
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri(format!(
+                "/api/domain/widgets/{}/facts/market_price/series?from=2026-01-01&to=2026-02-01",
+                Uuid::from_u128(7)
+            ))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body).await, "unknown_subject");
+
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri(format!("{base}?from=2026-01-01&to=2026-02-01"))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error_code(&body).await, "infrastructure");
+}

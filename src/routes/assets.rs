@@ -166,3 +166,35 @@ pub async fn search_assets(
         Err(error) => domain_error_response(&error),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obolargus_core::domain::error::DomainError;
+
+    #[test]
+    fn maps_an_asset_option_to_the_wire_body() {
+        let body = AssetOptionBody::from_option(AssetOption {
+            id: Uuid::from_u128(1),
+            display_name: "Example".to_string(),
+            asset_type: "stock".to_string(),
+            currency: "USD".to_string(),
+            primary_identifier: Some("EX".to_string()),
+        });
+        assert_eq!(body.display_name, "Example");
+        assert_eq!(body.primary_identifier.as_deref(), Some("EX"));
+    }
+
+    #[tokio::test]
+    async fn maps_domain_errors_to_contract_statuses() {
+        let validation = domain_error_response(&DomainError::Validation("bad".into()));
+        assert_eq!(validation.status(), StatusCode::BAD_REQUEST);
+
+        let infrastructure =
+            domain_error_response(&DomainError::Infrastructure(sqlx::Error::PoolClosed));
+        assert_eq!(infrastructure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let other = domain_error_response(&DomainError::not_found("Asset", "id"));
+        assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

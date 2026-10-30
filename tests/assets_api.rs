@@ -115,3 +115,34 @@ async fn search_matches_name_and_identifier() {
         .await
         .expect("cleanup asset");
 }
+
+fn app_without_database() -> axum::Router {
+    router(AppState::new(AppConfig::default(), None).expect("state"))
+}
+
+#[tokio::test]
+async fn search_validates_query_and_limit_without_a_database() {
+    let app = app_without_database();
+    let long_query = "a".repeat(201);
+    for (uri, code) in [
+        ("/api/assets?limit=0", "invalid_limit"),
+        ("/api/assets?limit=51", "invalid_limit"),
+        (
+            &format!("/api/assets?q={long_query}") as &str,
+            "invalid_query",
+        ),
+    ] {
+        let (status, body) = send(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["code"], code);
+    }
+}
+
+#[tokio::test]
+async fn search_without_a_database_returns_infrastructure() {
+    let (status, body) = send(&app_without_database(), "/api/assets?q=AAPL").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["error"]["code"], "infrastructure");
+}
