@@ -281,7 +281,7 @@ async fn http_range_load_groups_rows_and_reports_progress() {
         eprintln!("SKIPPED: no test database configured");
         return;
     };
-    let ticker = format!("M{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let ticker = format!("M{}", &Uuid::new_v4().simple().to_string()[..8]).to_ascii_uppercase();
     let asset = obolargus_core::domain::asset::create::create_asset(
         &pool,
         obolargus_core::domain::asset::entity::NewAsset {
@@ -362,7 +362,7 @@ async fn http_single_date_load_reports_stored_provenance() {
         eprintln!("SKIPPED: no test database configured");
         return;
     };
-    let ticker = format!("N{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let ticker = format!("N{}", &Uuid::new_v4().simple().to_string()[..8]).to_ascii_uppercase();
     let asset = obolargus_core::domain::asset::create::create_asset(
         &pool,
         obolargus_core::domain::asset::entity::NewAsset {
