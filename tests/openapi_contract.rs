@@ -22,12 +22,14 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/market-data/reconcile"),
     ("post", "/api/market-data/load"),
     ("post", "/api/market-data/load-range"),
+    ("post", "/api/market-data/load-range/async"),
     ("get", "/api/data-load/domains"),
     ("get", "/api/data-load/sources"),
     ("patch", "/api/data-load/sources/{source_id}"),
     ("get", "/api/data-load/history"),
     ("get", "/api/data-load/history/{entry_id}"),
     ("get", "/api/data-load/history/groups/{group_id}/progress"),
+    ("post", "/api/data-load/history/groups/{group_id}/stop"),
     (
         "get",
         "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
@@ -182,6 +184,9 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 ("get", "/api/data-load/history/{entry_id}") => {
                     ["200", "400", "404", "503"].into_iter().collect()
                 }
+                ("post", "/api/data-load/history/groups/{group_id}/stop") => {
+                    ["200", "400"].into_iter().collect()
+                }
                 _ => ["200", "400", "503"].into_iter().collect(),
             };
             assert_eq!(
@@ -226,6 +231,25 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 assert!(
                     responses[*status]["content"]["application/json"].is_object(),
                     "{method} {path} {status} must document a JSON error envelope"
+                );
+            }
+            continue;
+        }
+
+        if *path == "/api/market-data/load-range/async" {
+            let expected: BTreeSet<&str> = ["202", "400", "409", "503"].into_iter().collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            assert!(
+                responses["202"]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON accepted body"
+            );
+            for status in ["400", "409", "503"] {
+                assert!(
+                    responses[status]["content"]["text/plain"].is_object(),
+                    "{method} {path} {status} must document a text/plain error body"
                 );
             }
             continue;

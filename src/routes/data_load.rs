@@ -410,3 +410,30 @@ pub async fn get_progress_handler(
     let progress = range_progress(pool, group_id).await.map_err(map_error)?;
     Ok(Json(progress))
 }
+
+/// Result of a stop request.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct StopRangeResult {
+    /// Whether a live background task was found and asked to stop.
+    ///
+    /// `false` means the group is not running in this server process (for
+    /// example after a restart); the UI treats that as a dismissible orphan.
+    pub stopped: bool,
+}
+
+/// `POST /api/data-load/history/groups/{group_id}/stop`
+#[utoipa::path(
+    post,
+    path = "/api/data-load/history/groups/{group_id}/stop",
+    tag = "data-load",
+    summary = "Stop a running range load",
+    description = "Requests cooperative cancellation of a live background range load. In-flight dates are allowed to finish; no new dates start. Returns stopped=false when the group is not active in this process.",
+    responses(
+        (status = 200, description = "The stop request outcome", body = StopRangeResult),
+        (status = 400, description = "Invalid group id", body = ApiErrorBody)
+    )
+)]
+pub async fn stop_range_handler(Path(group_id): Path<Uuid>) -> ApiResult<StopRangeResult> {
+    let stopped = crate::routes::load_cancellation::cancel(group_id);
+    Ok(Json(StopRangeResult { stopped }))
+}

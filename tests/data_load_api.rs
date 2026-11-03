@@ -152,6 +152,18 @@ async fn progress_requires_a_database() {
 }
 
 #[tokio::test]
+async fn stopping_an_inactive_group_reports_false() {
+    let (status, body) = send(
+        "POST",
+        "/api/data-load/history/groups/00000000-0000-4000-8000-000000000001/stop",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"stopped\":false"));
+}
+
+#[tokio::test]
 async fn non_loadable_domain_is_rejected_before_the_pool() {
     let (status, body) = send(
         "POST",

@@ -27,6 +27,7 @@ use obolargus_core::market_data::load::{
 };
 use obolargus_core::market_data::load_range::{
     IdentifierRangeLoadConfig, IdentifierRangeLoadReport, run_identifier_range_load_with_group,
+    run_identifier_range_load_with_group_cancellable,
 };
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
@@ -401,6 +402,142 @@ fn default_concurrency() -> usize {
     4
 }
 
+/// A validated range-load request ready to hand to the background runner.
+struct PreparedRangeLoad {
+    identifiers: Vec<TypedIdentifier>,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+    concurrency: usize,
+    source: Option<String>,
+    create_missing_assets: bool,
+    data_domain: DataDomain,
+    group_id: Uuid,
+}
+
+/// Validates a range request before any database work.
+///
+/// Shared by the synchronous and fire-and-forget range endpoints so both
+/// surfaces reject the same inputs with the same messages.
+fn validate_range_load(body: LoadRangeBody) -> Result<PreparedRangeLoad, (StatusCode, String)> {
+    let mut identifiers = Vec::with_capacity(body.identifiers.len());
+    for input in body.identifiers {
+        identifiers.push(
+            input
+                .into_identifier()
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("validation error: {e}")))?,
+        );
+    }
+    if identifiers.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "validation error: the identifier list is empty".to_string(),
+        ));
+    }
+
+    let from = chrono::NaiveDate::parse_from_str(body.from.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: '{}' is not a valid YYYY-MM-DD date",
+                body.from
+            ),
+        )
+    })?;
+    let to = chrono::NaiveDate::parse_from_str(body.to.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: '{}' is not a valid YYYY-MM-DD date",
+                body.to
+            ),
+        )
+    })?;
+    let data_domain = parse_data_domain(&body.data_domain)?;
+    let group_id = match body.client_group_id.as_deref() {
+        Some(raw) => Uuid::parse_str(raw.trim()).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("validation error: '{raw}' is not a valid group id"),
+            )
+        })?,
+        None => Uuid::new_v4(),
+    };
+
+    let today = chrono::Utc::now().date_naive();
+    if from > to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: range start {from} is later than range end {to}"),
+        ));
+    }
+    if to > today {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: as-of date {to} is later than today ({today})"),
+        ));
+    }
+    if body.concurrency == 0
+        || body.concurrency > obolargus_core::market_data::load_range::MAX_CONCURRENCY
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: concurrency must be between 1 and {}",
+                obolargus_core::market_data::load_range::MAX_CONCURRENCY
+            ),
+        ));
+    }
+
+    Ok(PreparedRangeLoad {
+        identifiers,
+        from,
+        to,
+        concurrency: body.concurrency,
+        source: body.source,
+        create_missing_assets: body.create_missing_assets,
+        data_domain,
+        group_id,
+    })
+}
+
+/// Rejects a group id that already names a run or range group.
+async fn ensure_group_id_available(
+    pool: &sqlx::PgPool,
+    group_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let conflict: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM reference_data_load_runs
+            WHERE id = $1 OR range_group_id = $1
+         )",
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("group id check failed: {e}"),
+        )
+    })?;
+    if conflict {
+        return Err((
+            StatusCode::CONFLICT,
+            "group_id_conflict: the client group id is already in use".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Response of the fire-and-forget range endpoint.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RangeLoadAccepted {
+    /// Client group id used by the progress endpoint and history detail.
+    pub group_id: Uuid,
+    /// Always `"accepted"` for a 202 response.
+    pub status: String,
+}
+
 /// Parses and validates the optional data domain.
 fn parse_data_domain(value: &Option<String>) -> Result<DataDomain, (StatusCode, String)> {
     let raw = value.as_deref().unwrap_or("market_data");
@@ -552,125 +689,114 @@ pub async fn load_range(
     State(state): State<AppState>,
     Json(body): Json<LoadRangeBody>,
 ) -> Result<Json<IdentifierRangeLoadReport>, (StatusCode, String)> {
-    let mut identifiers = Vec::with_capacity(body.identifiers.len());
-    for input in body.identifiers {
-        identifiers.push(
-            input
-                .into_identifier()
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("validation error: {e}")))?,
-        );
-    }
-    if identifiers.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "validation error: the identifier list is empty".to_string(),
-        ));
-    }
-
-    let from = chrono::NaiveDate::parse_from_str(body.from.trim(), "%Y-%m-%d").map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "validation error: '{}' is not a valid YYYY-MM-DD date",
-                body.from
-            ),
-        )
-    })?;
-    let to = chrono::NaiveDate::parse_from_str(body.to.trim(), "%Y-%m-%d").map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "validation error: '{}' is not a valid YYYY-MM-DD date",
-                body.to
-            ),
-        )
-    })?;
-    let data_domain = parse_data_domain(&body.data_domain)?;
-    let group_id = match body.client_group_id.as_deref() {
-        Some(raw) => Uuid::parse_str(raw.trim()).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("validation error: '{raw}' is not a valid group id"),
-            )
-        })?,
-        None => Uuid::new_v4(),
-    };
-
-    let today = chrono::Utc::now().date_naive();
-    if from > to {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("validation error: range start {from} is later than range end {to}"),
-        ));
-    }
-    if to > today {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("validation error: as-of date {to} is later than today ({today})"),
-        ));
-    }
-    if body.concurrency == 0
-        || body.concurrency > obolargus_core::market_data::load_range::MAX_CONCURRENCY
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "validation error: concurrency must be between 1 and {}",
-                obolargus_core::market_data::load_range::MAX_CONCURRENCY
-            ),
-        ));
-    }
-
+    let prepared = validate_range_load(body)?;
     let pool = state.pool.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "no database pool configured".to_string(),
         )
     })?;
-
-    let conflict: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM reference_data_load_runs
-            WHERE id = $1 OR range_group_id = $1
-         )",
-    )
-    .bind(group_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("group id check failed: {e}"),
-        )
-    })?;
-    if conflict {
-        return Err((
-            StatusCode::CONFLICT,
-            "group_id_conflict: the client group id is already in use".to_string(),
-        ));
-    }
+    ensure_group_id_available(pool, prepared.group_id).await?;
 
     let report = run_identifier_range_load_with_group(
         Some(pool),
         &state.market_data,
         IdentifierRangeLoadConfig {
-            identifiers,
-            from,
-            to,
-            preferred_source: body.source,
+            identifiers: prepared.identifiers,
+            from: prepared.from,
+            to: prepared.to,
+            preferred_source: prepared.source,
             trigger: "api".to_string(),
             dry_run: false,
-            concurrency: body.concurrency,
-            create_missing_assets: body.create_missing_assets,
+            concurrency: prepared.concurrency,
+            create_missing_assets: prepared.create_missing_assets,
             default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY.to_string(),
         },
-        group_id,
-        data_domain,
+        prepared.group_id,
+        prepared.data_domain,
     )
     .await
     .map_err(|e| typed_error_to_http(&e))?;
 
     Ok(Json(report))
+}
+
+/// `POST /api/market-data/load-range/async` — validate a range, start it in
+/// the background, and return immediately with the group id to poll.
+///
+/// The progress endpoint already reads completed child rows, so the UI can
+/// poll `GET /api/data-load/history/groups/{group_id}/progress` and fetch the
+/// final `GET /api/data-load/history/{group_id}` detail when it settles.
+#[utoipa::path(
+    post,
+    path = "/api/market-data/load-range/async",
+    tag = "market-data",
+    summary = "Start a date-range load in the background",
+    description = "Validates the range synchronously, starts the load in the background, and returns 202 with the client group id. Poll the data-load progress endpoint for completion, then read the history detail for the report.",
+    request_body = LoadRangeBody,
+    responses(
+        (status = 202, description = "The range load was accepted", body = RangeLoadAccepted),
+        (status = 400, description = "Invalid identifier, date, range or concurrency", body = String, content_type = "text/plain"),
+        (status = 409, description = "The client group id is already in use", body = String, content_type = "text/plain"),
+        (status = 503, description = "No database pool is configured", body = String, content_type = "text/plain")
+    )
+)]
+pub async fn start_load_range(
+    State(state): State<AppState>,
+    Json(body): Json<LoadRangeBody>,
+) -> Result<(StatusCode, Json<RangeLoadAccepted>), (StatusCode, String)> {
+    let prepared = validate_range_load(body)?;
+    let pool = state.pool.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no database pool configured".to_string(),
+        )
+    })?;
+    ensure_group_id_available(pool, prepared.group_id).await?;
+    let group_id = prepared.group_id;
+    let cancel = crate::routes::load_cancellation::register(group_id).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cancellation registry unavailable".to_string(),
+        )
+    })?;
+    let background_pool = pool.clone();
+    let registry = state.market_data.clone();
+
+    tokio::spawn(async move {
+        let result = run_identifier_range_load_with_group_cancellable(
+            Some(&background_pool),
+            &registry,
+            IdentifierRangeLoadConfig {
+                identifiers: prepared.identifiers,
+                from: prepared.from,
+                to: prepared.to,
+                preferred_source: prepared.source,
+                trigger: "api".to_string(),
+                dry_run: false,
+                concurrency: prepared.concurrency,
+                create_missing_assets: prepared.create_missing_assets,
+                default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY
+                    .to_string(),
+            },
+            group_id,
+            prepared.data_domain,
+            Some(cancel),
+        )
+        .await;
+        crate::routes::load_cancellation::finish(group_id);
+        if let Err(error) = result {
+            tracing::error!(%group_id, %error, "background range load failed");
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RangeLoadAccepted {
+            group_id,
+            status: "accepted".to_string(),
+        }),
+    ))
 }
 
 /// Maps a typed provider error onto an HTTP status code and message.

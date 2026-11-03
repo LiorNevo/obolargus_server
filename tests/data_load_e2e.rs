@@ -357,6 +357,86 @@ async fn http_range_load_groups_rows_and_reports_progress() {
 }
 
 #[tokio::test]
+async fn http_async_range_load_returns_202_and_progress_completes() {
+    let Some(pool) = migrated_pool().await else {
+        eprintln!("SKIPPED: no test database configured");
+        return;
+    };
+    let ticker = format!("A{}", &Uuid::new_v4().simple().to_string()[..8]).to_ascii_uppercase();
+    let asset = obolargus_core::domain::asset::create::create_asset(
+        &pool,
+        obolargus_core::domain::asset::entity::NewAsset {
+            asset_type: "Equity".to_string(),
+            display_name: format!("Async {ticker}"),
+            currency: "USD".to_string(),
+            backed_by_portfolio_id: None,
+            issuer_id: None,
+        },
+    )
+    .await
+    .expect("asset");
+    obolargus_core::domain::asset_identifier::create::create_asset_identifier(
+        &pool,
+        obolargus_core::domain::asset_identifier::entity::NewAssetIdentifier {
+            asset_id: obolargus_core::domain::id::AssetId(asset.id),
+            scheme: "TICKER:XNAS".to_string(),
+            value: ticker.clone(),
+        },
+    )
+    .await
+    .expect("identifier");
+
+    let registry = std::sync::Arc::new(
+        obolargus_core::market_data::registry::DataSourceRegistry::new(vec![std::sync::Arc::new(
+            RangeSource {
+                source_id: "yahoo_finance".to_string(),
+            },
+        )])
+        .expect("registry"),
+    );
+    let state = AppState {
+        config: AppConfig::default(),
+        pool: Some(pool.clone()),
+        market_data: registry,
+    };
+    let group_id = Uuid::new_v4();
+    let body = format!(
+        r#"{{"identifiers":["TICKER:XNAS:{ticker}"],"from":"2026-10-01","to":"2026-10-02","concurrency":2,"client_group_id":"{group_id}","data_domain":"market_data"}}"#
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/market-data/load-range/async")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(json["group_id"], group_id.to_string());
+    assert_eq!(json["status"], "accepted");
+
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let progress = range_progress(&pool, group_id).await.expect("progress");
+            if progress.status != "starting" && progress.status != "running" {
+                break progress;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("background load settles");
+
+    assert_eq!(progress.status, "complete");
+    assert_eq!(progress.dates_completed, 2);
+}
+
+#[tokio::test]
 async fn http_single_date_load_reports_stored_provenance() {
     let Some(pool) = migrated_pool().await else {
         eprintln!("SKIPPED: no test database configured");
