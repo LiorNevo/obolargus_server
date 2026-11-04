@@ -152,6 +152,30 @@ async fn progress_requires_a_database() {
 }
 
 #[tokio::test]
+async fn async_range_validates_before_the_pool() {
+    let (status, body) = send(
+        "POST",
+        "/api/market-data/load-range/async",
+        r#"{"identifiers":["TICKER:XNAS:AAPL"],"from":"2026-10-01","to":"2026-10-02","client_group_id":"not-a-uuid"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("not a valid group id"));
+}
+
+#[tokio::test]
+async fn async_range_requires_a_pool_after_validation() {
+    let (status, body) = send(
+        "POST",
+        "/api/market-data/load-range/async",
+        r#"{"identifiers":["TICKER:XNAS:AAPL"],"from":"2026-10-01","to":"2026-10-02"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("no database pool configured"));
+}
+
+#[tokio::test]
 async fn stopping_an_inactive_group_reports_false() {
     let (status, body) = send(
         "POST",

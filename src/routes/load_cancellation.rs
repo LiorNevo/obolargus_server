@@ -46,3 +46,27 @@ pub fn finish(group_id: Uuid) {
         registry.remove(&group_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn registered_groups_can_be_cancelled_and_removed() {
+        let group_id = Uuid::new_v4();
+        let flag = register(group_id).expect("register");
+        assert!(!flag.load(Ordering::Relaxed));
+
+        assert!(cancel(group_id));
+        assert!(flag.load(Ordering::Relaxed));
+
+        finish(group_id);
+        assert!(!cancel(group_id));
+    }
+
+    #[test]
+    fn cancelling_an_unknown_group_reports_false() {
+        assert!(!cancel(Uuid::new_v4()));
+    }
+}
