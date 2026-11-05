@@ -113,6 +113,7 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::market_data::start_load_range))
         .routes(routes!(routes::data_load::list_domains))
         .routes(routes!(routes::data_load::list_sources))
+        .routes(routes!(routes::data_load::identifier_search))
         .routes(routes!(routes::data_load::toggle_source))
         .routes(routes!(routes::data_load::list_history_handler))
         .routes(routes!(routes::data_load::get_history_handler))

@@ -25,6 +25,7 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/market-data/load-range/async"),
     ("get", "/api/data-load/domains"),
     ("get", "/api/data-load/sources"),
+    ("get", "/api/data-load/identifier-search"),
     ("patch", "/api/data-load/sources/{source_id}"),
     ("get", "/api/data-load/history"),
     ("get", "/api/data-load/history/{entry_id}"),
@@ -179,6 +180,9 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                     ["200", "400", "404", "409", "500", "503"]
                         .into_iter()
                         .collect()
+                }
+                ("get", "/api/data-load/identifier-search") => {
+                    ["200", "400", "500", "503"].into_iter().collect()
                 }
                 ("get", "/api/data-load/history") => ["200", "400", "503"].into_iter().collect(),
                 ("get", "/api/data-load/history/{entry_id}") => {

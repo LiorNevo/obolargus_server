@@ -17,6 +17,9 @@ use obolargus_core::market_data::history::{
     HistoryFilter, LoadHistoryDetail, LoadHistoryPage, RangeProgress, get_history_detail,
     list_history, range_progress,
 };
+use obolargus_core::market_data::identifier_search::{
+    IdentifierSearchError, IdentifierSearchRequest, IdentifierSearchResult, search_identifiers,
+};
 use obolargus_core::market_data::registry::SourceCatalogEntry;
 use obolargus_core::market_data::source_state::{SourceStateChangeResult, set_source_enabled};
 
@@ -184,6 +187,82 @@ pub async fn list_sources(
         domain: domain.map(|value| value.as_str().to_string()),
         sources: state.market_data.catalog(domain),
     }))
+}
+
+/// Query for the read-only identifier search.
+#[derive(Debug, Deserialize)]
+pub struct IdentifierSearchQuery {
+    /// Free-text ticker or company-name query.
+    pub q: Option<String>,
+    /// Optional data domain (defaults to `market_data`).
+    pub domain: Option<String>,
+    /// Optional single-source filter.
+    pub source: Option<String>,
+    /// Optional canonical asset-type filter.
+    pub asset_type: Option<String>,
+    /// Optional MIC or raw-exchange filter.
+    pub exchange: Option<String>,
+    /// Page size.
+    pub limit: Option<i64>,
+    /// Zero-based page offset.
+    pub offset: Option<i64>,
+}
+
+fn map_identifier_search_error(error: IdentifierSearchError) -> (StatusCode, Json<ApiErrorBody>) {
+    match error {
+        IdentifierSearchError::Validation(message) => {
+            api_error(StatusCode::BAD_REQUEST, "validation_error", message)
+        }
+        IdentifierSearchError::Storage(message) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_failure",
+            message,
+        ),
+    }
+}
+
+/// `GET /api/data-load/identifier-search`
+#[utoipa::path(
+    get,
+    path = "/api/data-load/identifier-search",
+    tag = "data-load",
+    summary = "Search external identifiers",
+    description = "Read-only discovery across enabled sources that can serve the domain. Upstream failures are reported in the 200 body so partial failure stays visible; the operation never writes.",
+    params(
+        ("q" = String, Query, description = "Free-text ticker or company name (2..=120 characters)"),
+        ("domain" = Option<String>, Query, description = "Data domain; defaults to market_data"),
+        ("source" = Option<String>, Query, description = "Single answering-source filter"),
+        ("asset_type" = Option<String>, Query, description = "Single canonical asset-type filter"),
+        ("exchange" = Option<String>, Query, description = "Single MIC or raw-exchange filter"),
+        ("limit" = Option<i64>, Query, description = "Page size (1..=100, default 25)"),
+        ("offset" = Option<i64>, Query, description = "Zero-based page offset")
+    ),
+    responses(
+        (status = 200, description = "Search outcomes, consolidated candidates, and a page of results", body = IdentifierSearchResult),
+        (status = 400, description = "Invalid query, domain, limit, or offset", body = ApiErrorBody),
+        (status = 500, description = "Known-state storage failure", body = ApiErrorBody),
+        (status = 503, description = "No database pool", body = ApiErrorBody)
+    )
+)]
+pub async fn identifier_search(
+    State(state): State<AppState>,
+    Query(query): Query<IdentifierSearchQuery>,
+) -> ApiResult<IdentifierSearchResult> {
+    let request = IdentifierSearchRequest::new(
+        query.q.as_deref().unwrap_or(""),
+        query.domain.as_deref(),
+        query.source,
+        query.asset_type,
+        query.exchange,
+        query.limit,
+        query.offset,
+    )
+    .map_err(map_identifier_search_error)?;
+    let pool = require_pool(&state)?;
+    let result = search_identifiers(&state.market_data.snapshot(), pool, &request)
+        .await
+        .map_err(map_identifier_search_error)?;
+    Ok(Json(result))
 }
 
 /// Body of `PATCH /api/data-load/sources/{source_id}`.
@@ -436,4 +515,79 @@ pub struct StopRangeResult {
 pub async fn stop_range_handler(Path(group_id): Path<Uuid>) -> ApiResult<StopRangeResult> {
     let stopped = crate::routes::load_cancellation::cancel(group_id);
     Ok(Json(StopRangeResult { stopped }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifier_search_errors_map_to_contract_statuses() {
+        let (status, Json(body)) =
+            map_identifier_search_error(IdentifierSearchError::Validation("bad query".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error.code, "validation_error");
+        assert_eq!(body.error.message, "bad query");
+
+        let (status, Json(body)) =
+            map_identifier_search_error(IdentifierSearchError::Storage("database down".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error.code, "storage_failure");
+        assert_eq!(body.error.message, "database down");
+    }
+
+    #[test]
+    fn provider_errors_map_to_contract_statuses() {
+        let cases = [
+            (
+                MarketDataProviderError::NotFound("missing".into()),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                MarketDataProviderError::Validation("bad".into()),
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+            ),
+            (
+                MarketDataProviderError::InvalidInput("bad".into()),
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+            ),
+            (
+                MarketDataProviderError::Unauthorized("denied".into()),
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            ),
+            (
+                MarketDataProviderError::Transient("down".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_failure",
+            ),
+            (
+                MarketDataProviderError::Infrastructure("down".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_failure",
+            ),
+            (
+                MarketDataProviderError::RateLimited {
+                    msg: "budget".into(),
+                    retry_after: None,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_failure",
+            ),
+            (
+                MarketDataProviderError::Unsupported("no".into()),
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let (status, Json(body)) = map_error(error);
+            assert_eq!(status, expected_status);
+            assert_eq!(body.error.code, expected_code);
+        }
+    }
 }

@@ -93,6 +93,7 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
             "/api/data-load/history/groups/{group_id}/progress",
             "/api/data-load/history/groups/{group_id}/stop",
             "/api/data-load/history/{entry_id}",
+            "/api/data-load/identifier-search",
             "/api/data-load/sources",
             "/api/data-load/sources/{source_id}",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
