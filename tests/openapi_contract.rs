@@ -31,6 +31,7 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/api/data-load/history/{entry_id}"),
     ("get", "/api/data-load/history/groups/{group_id}/progress"),
     ("post", "/api/data-load/history/groups/{group_id}/stop"),
+    ("get", "/api/domain/fact-types"),
     (
         "get",
         "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
@@ -207,6 +208,25 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                     "{method} {path} {status} must document a JSON error envelope"
                 );
             }
+            continue;
+        }
+
+        // The catalog endpoint is a static read with only success and a
+        // no-database failure.
+        if *path == "/api/domain/fact-types" {
+            let expected: BTreeSet<&str> = ["200", "503"].into_iter().collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            assert!(
+                responses["200"]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON success body"
+            );
+            assert!(
+                responses["503"]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON error envelope"
+            );
             continue;
         }
 

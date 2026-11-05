@@ -119,6 +119,7 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::data_load::get_history_handler))
         .routes(routes!(routes::data_load::get_progress_handler))
         .routes(routes!(routes::data_load::stop_range_handler))
+        .routes(routes!(routes::temporal::list_fact_types))
         .routes(routes!(routes::temporal::get_fact))
         .routes(routes!(routes::temporal::append_fact_handler))
         .routes(routes!(routes::temporal::retract_fact_handler))

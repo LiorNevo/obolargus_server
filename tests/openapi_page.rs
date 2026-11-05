@@ -96,6 +96,7 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
             "/api/data-load/identifier-search",
             "/api/data-load/sources",
             "/api/data-load/sources/{source_id}",
+            "/api/domain/fact-types",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",

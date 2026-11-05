@@ -179,6 +179,10 @@ async fn migrated_pool() -> Option<sqlx::PgPool> {
         eprintln!("SKIPPED: could not apply the migrations: {error}");
         return None;
     }
+    if let Err(error) = obolargus_core::temporal::catalog::sync_fact_catalog(&pool).await {
+        eprintln!("SKIPPED: could not sync the fact catalog: {error}");
+        return None;
+    }
     Some(pool)
 }
 
@@ -237,16 +241,23 @@ async fn seed_bare_asset(pool: &sqlx::PgPool) -> uuid::Uuid {
 /// application role has no DELETE privilege; the test harness connects as
 /// the table owner.)
 async fn cleanup_asset(pool: &sqlx::PgPool, asset_id: uuid::Uuid) {
-    sqlx::query("DELETE FROM data_source_reconciliation_audits WHERE asset_id = $1")
+    sqlx::query(
+        "DELETE FROM fact_reconciliations WHERE subject_kind = 'asset' AND subject_id = $1",
+    )
+    .bind(asset_id)
+    .execute(pool)
+    .await
+    .expect("delete reconciliation audits");
+    sqlx::query("DELETE FROM market_observations WHERE asset_id = $1")
         .bind(asset_id)
         .execute(pool)
         .await
-        .expect("delete reconciliation audits");
-    sqlx::query("DELETE FROM asset_reference_data WHERE asset_id = $1")
+        .expect("delete market observations");
+    sqlx::query("DELETE FROM temporal_facts WHERE asset_id = $1")
         .bind(asset_id)
         .execute(pool)
         .await
-        .expect("delete reference data");
+        .expect("delete temporal facts");
     sqlx::query("DELETE FROM asset_identifiers WHERE asset_id = $1")
         .bind(asset_id)
         .execute(pool)
@@ -282,9 +293,10 @@ fn fixed_bar(source_id: &str, as_of_date: NaiveDate) -> LatestBar {
     }
 }
 
-/// T054 / T113: `run_refresh` writes an `AssetReferenceData` row and a
+/// T054 / T113: `run_refresh` writes a typed market observation and a
 /// `data_source_refresh_runs` audit row.
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn run_refresh_writes_reference_data_and_audit_row() {
     let Some(pool) = migrated_pool().await else {
         eprintln!("SKIPPED: no test database configured");
@@ -319,26 +331,36 @@ async fn run_refresh_writes_reference_data_and_audit_row() {
     assert_eq!(summary.assets_refreshed, 1, "one asset should be refreshed");
     assert_eq!(summary.assets_attempted, 1);
 
-    // The `AssetReferenceData` row exists with the expected shape.
-    let value: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT fact_type, source, value FROM asset_reference_data WHERE asset_id = $1",
+    // The `market_observations` row exists with the expected typed shape.
+    let value: Option<(
+        String,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+    )> = sqlx::query_as(
+        "SELECT source, open, high, low, close, adjclose, volume \
+         FROM market_observations WHERE asset_id = $1 AND kind = 'eod'",
     )
     .bind(asset_id)
     .fetch_optional(&pool)
     .await
-    .expect("query reference data");
-    let (fact_type, source, payload) = value.expect("a reference-data row should exist");
-    assert_eq!(fact_type, "market_price");
+    .expect("query market observations");
+    let (source, open, high, low, close, adjclose, volume) =
+        value.expect("a market observation should exist");
     assert_eq!(source, "mock");
-
-    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("value is JSON");
-    for field in ["open", "high", "low", "close", "adjclose", "volume"] {
-        assert!(
-            parsed.get(field).is_some(),
-            "the value payload should carry a '{field}' field (got {parsed})"
-        );
+    for (name, field) in [
+        ("open", open),
+        ("high", high),
+        ("low", low),
+        ("close", close),
+        ("adjclose", adjclose),
+        ("volume", volume),
+    ] {
+        assert!(field.is_some(), "the observation should carry {name}");
     }
-    assert!(parsed["close"].is_string(), "prices are decimal strings");
 
     // The audit row exists.
     let trigger: Option<(String,)> =
@@ -393,7 +415,7 @@ async fn run_refresh_skips_asset_without_supported_identifier() {
     assert_eq!(summary.assets_refreshed, 0);
 
     let rows: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM asset_reference_data WHERE asset_id = $1")
+        sqlx::query_as("SELECT COUNT(*) FROM market_observations WHERE asset_id = $1")
             .bind(asset_id)
             .fetch_one(&pool)
             .await
@@ -597,8 +619,8 @@ async fn run_refresh_is_idempotent_on_a_rerun() {
 
     // Exactly one row exists — no duplicate.
     let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM asset_reference_data \
-         WHERE asset_id = $1 AND fact_type = 'market_price'",
+        "SELECT COUNT(*) FROM market_observations \
+         WHERE asset_id = $1 AND kind = 'eod'",
     )
     .bind(asset_id)
     .fetch_one(&pool)
@@ -741,10 +763,10 @@ async fn reconcile_primary_wins_writes_the_canonical_value_and_audit() {
 
     assert_eq!(summary.per_source_answers.len(), 2);
 
-    // The canonical value was written as an `AssetReferenceData` row.
+    // The canonical value was written as a typed market observation.
     let source: Option<(String,)> = sqlx::query_as(
-        "SELECT source FROM asset_reference_data \
-         WHERE asset_id = $1 AND fact_type = 'market_price'",
+        "SELECT source FROM market_observations \
+         WHERE asset_id = $1 AND kind = 'eod'",
     )
     .bind(asset_id)
     .fetch_optional(&pool)
@@ -758,15 +780,15 @@ async fn reconcile_primary_wins_writes_the_canonical_value_and_audit() {
 
     // The audit row records the policy, the sources tried, and the
     // per-source answers.
-    let audit: Option<(String, Vec<String>, serde_json::Value, String)> = sqlx::query_as(
-        "SELECT policy, sources_tried, per_source_answers, canonical_value \
-         FROM data_source_reconciliation_audits WHERE id = $1",
+    let audit: Option<(String, Vec<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT policy, sources_tried, per_source_answers \
+         FROM fact_reconciliations WHERE id = $1",
     )
     .bind(summary.reconciliation_id)
     .fetch_optional(&pool)
     .await
     .expect("query reconciliation audit");
-    let (policy, sources_tried, per_source, canonical) = audit.expect("an audit row should exist");
+    let (policy, sources_tried, per_source) = audit.expect("an audit row should exist");
     assert_eq!(policy, "primary_wins");
     assert_eq!(sources_tried.len(), 2);
     assert!(
@@ -774,7 +796,6 @@ async fn reconcile_primary_wins_writes_the_canonical_value_and_audit() {
         "both sources should be recorded (got {per_source})"
     );
     assert!(per_source.get("b_secondary").is_some());
-    assert!(!canonical.is_empty());
 
     cleanup_asset(&pool, asset_id).await;
 }
@@ -821,8 +842,8 @@ async fn reconcile_first_non_empty_picks_the_first_answer() {
     .expect("run_reconcile");
 
     let source: Option<(String,)> = sqlx::query_as(
-        "SELECT source FROM asset_reference_data \
-         WHERE asset_id = $1 AND fact_type = 'market_price'",
+        "SELECT source FROM market_observations \
+         WHERE asset_id = $1 AND kind = 'eod'",
     )
     .bind(asset_id)
     .fetch_optional(&pool)
@@ -835,7 +856,7 @@ async fn reconcile_first_non_empty_picks_the_first_answer() {
     );
 
     let policy: Option<(String,)> =
-        sqlx::query_as("SELECT policy FROM data_source_reconciliation_audits WHERE id = $1")
+        sqlx::query_as("SELECT policy FROM fact_reconciliations WHERE id = $1")
             .bind(summary.reconciliation_id)
             .fetch_optional(&pool)
             .await
@@ -884,7 +905,7 @@ async fn reconcile_with_one_source_is_a_validation_error() {
 
     // No audit row and no reference-data row were written.
     let audits: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM data_source_reconciliation_audits WHERE asset_id = $1",
+        "SELECT COUNT(*) FROM fact_reconciliations WHERE subject_kind = 'asset' AND subject_id = $1",
     )
     .bind(asset_id)
     .fetch_one(&pool)
@@ -892,7 +913,7 @@ async fn reconcile_with_one_source_is_a_validation_error() {
     .expect("count audits");
     assert_eq!(audits.0, 0, "no audit row should be written");
     let rows: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM asset_reference_data WHERE asset_id = $1")
+        sqlx::query_as("SELECT COUNT(*) FROM market_observations WHERE asset_id = $1")
             .bind(asset_id)
             .fetch_one(&pool)
             .await
@@ -942,8 +963,8 @@ async fn reconcile_survives_a_single_source_failure() {
     .expect("run_reconcile should survive one source failing");
 
     let source: Option<(String,)> = sqlx::query_as(
-        "SELECT source FROM asset_reference_data \
-         WHERE asset_id = $1 AND fact_type = 'market_price'",
+        "SELECT source FROM market_observations \
+         WHERE asset_id = $1 AND kind = 'eod'",
     )
     .bind(asset_id)
     .fetch_optional(&pool)
@@ -952,13 +973,12 @@ async fn reconcile_survives_a_single_source_failure() {
     assert_eq!(source.map(|(s,)| s), Some("b_ok".to_string()));
 
     // The failure is recorded in the audit's per-source answers.
-    let per_source: Option<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT per_source_answers FROM data_source_reconciliation_audits WHERE id = $1",
-    )
-    .bind(summary.reconciliation_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("query reconciliation audit");
+    let per_source: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT per_source_answers FROM fact_reconciliations WHERE id = $1")
+            .bind(summary.reconciliation_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query reconciliation audit");
     let per_source = per_source.expect("an audit row should exist").0;
     assert!(
         per_source
@@ -1020,7 +1040,7 @@ async fn run_refresh_with_no_asset_list_scans_all_assets() {
 
     // The bare asset got no reference-data row.
     let bare_rows: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM asset_reference_data WHERE asset_id = $1")
+        sqlx::query_as("SELECT COUNT(*) FROM market_observations WHERE asset_id = $1")
             .bind(without_identifier)
             .fetch_one(&pool)
             .await

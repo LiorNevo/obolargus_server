@@ -23,9 +23,9 @@ use uuid::Uuid;
 use obolargus_core::temporal::facts::read::{
     fact_as_known, fact_at, fact_history, fact_series_page,
 };
-use obolargus_core::temporal::facts::write::{append_fact, revoke_fact};
 use obolargus_core::temporal::{
-    FactPoint, FactSubject, KnownAt, TemporalError, TemporalWindow, ValidAt,
+    FactInput, FactPoint, FactSubject, FactValue, KnownAt, RetractionInput, TemporalError,
+    TemporalWindow, ValidAt, retract_fact, write_fact,
 };
 
 use crate::AppState;
@@ -42,16 +42,21 @@ pub struct FactPointBody {
     pub id: Uuid,
     /// The fact type.
     pub fact_type: String,
+    /// The catalog schema version.
+    pub schema_version: i32,
     /// Valid time, RFC 3339 UTC.
     pub valid_at: String,
     /// Transaction time, RFC 3339 UTC.
     pub known_at: String,
-    /// The domain payload.
-    pub value: String,
+    /// The typed domain payload, or `null` for a retraction.
+    #[schema(value_type = Option<Object>)]
+    pub value: Option<serde_json::Value>,
     /// The reporting source.
     pub source: String,
     /// Whether this belief retracts the value.
     pub retracted: bool,
+    /// Why the value was retracted.
+    pub retraction_reason: Option<String>,
 }
 
 impl FactPointBody {
@@ -61,6 +66,7 @@ impl FactPointBody {
             subject_id: point.subject.id(),
             id: point.id,
             fact_type: point.fact_type.clone(),
+            schema_version: point.schema_version,
             valid_at: point
                 .valid_at
                 .as_datetime()
@@ -69,11 +75,154 @@ impl FactPointBody {
                 .known_at
                 .as_datetime()
                 .to_rfc3339_opts(SecondsFormat::AutoSi, true),
-            value: point.value.clone(),
+            value: point
+                .value
+                .as_ref()
+                .and_then(|value| serde_json::to_value(value).ok()),
             source: point.source.clone(),
             retracted: point.retracted,
+            retraction_reason: point.retraction_reason.clone(),
         }
     }
+}
+
+/// One field in the data dictionary.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct FactFieldBody {
+    /// Field name.
+    pub name: String,
+    /// Logical data type.
+    pub data_type: String,
+    /// Whether the field may be absent.
+    pub nullable: bool,
+    /// Unit of measure.
+    pub unit: Option<String>,
+    /// Decimal precision.
+    pub precision: Option<i32>,
+    /// Decimal scale.
+    pub scale: Option<i32>,
+    /// Closed value vocabulary, when any.
+    pub allowed_values: Vec<String>,
+    /// Aggregates that apply to the field.
+    pub aggregates: Vec<String>,
+    /// Human-readable description.
+    pub description: String,
+}
+
+/// One fact type in the data dictionary.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct FactTypeBody {
+    /// Stable fact type key.
+    pub fact_type: String,
+    /// Human-readable label.
+    pub display_name: String,
+    /// One-sentence description.
+    pub description: String,
+    /// Physical storage shape.
+    pub storage_kind: String,
+    /// Aggregate that applies to the fact as a whole.
+    pub aggregation: String,
+    /// Unit of the fact as a whole.
+    pub unit: Option<String>,
+    /// Observation kind for observation facts.
+    pub observation_kind: Option<String>,
+    /// Observation interval for observation facts.
+    pub interval_seconds: Option<i32>,
+    /// Catalog schema version.
+    pub schema_version: i32,
+    /// Subject kinds this fact applies to.
+    pub subjects: Vec<String>,
+    /// Typed fields of the value.
+    pub fields: Vec<FactFieldBody>,
+    /// Sources that declare support for this fact type.
+    pub supported_by_sources: Vec<String>,
+}
+
+/// The data-dictionary response.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct FactTypesResponse {
+    /// Every fact type in the catalog.
+    pub fact_types: Vec<FactTypeBody>,
+}
+
+/// `GET /api/domain/fact-types` — the machine-readable data dictionary.
+#[utoipa::path(
+    get,
+    path = "/api/domain/fact-types",
+    tag = "temporal",
+    summary = "Read the fact catalog",
+    responses(
+        (status = 200, description = "Every fact type and its fields", body = FactTypesResponse),
+        (status = 503, description = "No database pool is configured", body = ErrorEnvelope)
+    )
+)]
+pub async fn list_fact_types(State(state): State<AppState>) -> Response {
+    let Some(pool) = state.pool.as_ref() else {
+        return series_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "infrastructure",
+            "The fact catalog is unavailable without a database.",
+        );
+    };
+
+    let mut fact_types = Vec::new();
+    for def in obolargus_core::temporal::catalog::fact_catalog() {
+        let supported_by_sources: Vec<String> = match sqlx::query_scalar(
+            "SELECT source_id FROM data_source_fact_types WHERE fact_type = $1 ORDER BY source_id",
+        )
+        .bind(def.fact_type)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(&TemporalError::Infrastructure(error));
+            }
+        };
+
+        fact_types.push(FactTypeBody {
+            fact_type: def.fact_type.to_string(),
+            display_name: def.display_name.to_string(),
+            description: def.description.to_string(),
+            storage_kind: def.storage_kind.as_str().to_string(),
+            aggregation: def.aggregation.to_string(),
+            unit: def.unit.map(str::to_string),
+            observation_kind: def.observation_kind.map(str::to_string),
+            interval_seconds: def.interval_seconds,
+            schema_version: def.schema_version,
+            subjects: def
+                .subjects
+                .iter()
+                .map(|subject| subject.as_str().to_string())
+                .collect(),
+            fields: def
+                .fields
+                .iter()
+                .map(|field| FactFieldBody {
+                    name: field.name.to_string(),
+                    data_type: field.data_type.to_string(),
+                    nullable: field.nullable,
+                    unit: field.unit.map(str::to_string),
+                    precision: field.precision,
+                    scale: field.scale,
+                    allowed_values: field
+                        .allowed_values
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                    aggregates: field
+                        .aggregates
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                    description: field.description.to_string(),
+                })
+                .collect(),
+            supported_by_sources,
+        });
+    }
+
+    Json(FactTypesResponse { fact_types }).into_response()
 }
 
 /// The single error envelope from the contract.
@@ -96,6 +245,12 @@ pub struct ErrorBody {
 pub fn error_response(error: &TemporalError) -> Response {
     let (status, code) = match error {
         TemporalError::InvalidTime { .. } => (StatusCode::BAD_REQUEST, "invalid_time"),
+        TemporalError::UnknownFactType { .. } => (StatusCode::BAD_REQUEST, "unknown_fact_type"),
+        TemporalError::InvalidSubject { .. } => (StatusCode::BAD_REQUEST, "invalid_subject"),
+        TemporalError::InvalidFactValue { .. } => (StatusCode::BAD_REQUEST, "invalid_fact_value"),
+        TemporalError::MissingPayload { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "missing_payload")
+        }
         TemporalError::UnsupportedInterval { .. } => {
             (StatusCode::BAD_REQUEST, "unsupported_interval")
         }
@@ -234,8 +389,9 @@ pub struct AppendFactBody {
     pub valid_at: String,
     /// Transaction time (RFC 3339).
     pub known_at: String,
-    /// The payload, stored verbatim.
-    pub value: String,
+    /// The typed payload, validated against the catalog.
+    #[schema(value_type = Object)]
+    pub value: FactValue,
     /// The reporting source.
     pub source: String,
 }
@@ -261,14 +417,16 @@ pub async fn append_fact_handler(
 ) -> Response {
     let result = async {
         let subject = subject_from_path(&subject, subject_id)?;
-        append_fact(
+        write_fact(
             pool(&state)?,
-            subject,
-            &fact_type,
-            parse_valid(&body.valid_at)?,
-            parse_known(&body.known_at)?,
-            &body.value,
-            &body.source,
+            FactInput {
+                subject,
+                fact_type,
+                valid_at: parse_valid(&body.valid_at)?,
+                known_at: parse_known(&body.known_at)?,
+                source: body.source,
+                value: body.value,
+            },
         )
         .await
     }
@@ -313,14 +471,16 @@ pub async fn retract_fact_handler(
 ) -> Response {
     let result = async {
         let subject = subject_from_path(&subject, subject_id)?;
-        revoke_fact(
+        retract_fact(
             pool(&state)?,
-            subject,
-            &fact_type,
-            parse_valid(&body.valid_at)?,
-            parse_known(&body.known_at)?,
-            &body.reason,
-            &body.source,
+            RetractionInput {
+                subject,
+                fact_type,
+                valid_at: parse_valid(&body.valid_at)?,
+                known_at: parse_known(&body.known_at)?,
+                source: body.source,
+                reason: body.reason,
+            },
         )
         .await
     }

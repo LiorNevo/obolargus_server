@@ -58,7 +58,9 @@ async fn seed_asset(pool: &PgPool) -> Uuid {
 
 async fn drop_asset(pool: &PgPool, id: Uuid) {
     for statement in [
-        "DELETE FROM asset_reference_data WHERE asset_id = $1",
+        "DELETE FROM fact_reconciliations WHERE subject_kind = 'asset' AND subject_id = $1",
+        "DELETE FROM market_observations WHERE asset_id = $1",
+        "DELETE FROM temporal_facts WHERE asset_id = $1",
         "DELETE FROM assets WHERE id = $1",
     ] {
         sqlx::query(statement)
@@ -108,6 +110,20 @@ async fn error_code(body: &Bytes) -> String {
 }
 
 /// A full append → read → history → retract round trip.
+fn price_value(close: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "market_price",
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "adjclose": close,
+        "volume": "1000",
+        "currency": "USD",
+        "adjustment": "unadjusted",
+    })
+}
+
 #[tokio::test]
 async fn fact_endpoints_round_trip() {
     let Some(pool) = migrated_pool().await else {
@@ -128,7 +144,7 @@ async fn fact_endpoints_round_trip() {
             json!({
                 "valid_at": "2026-02-01",
                 "known_at": "2026-02-02T00:00:00Z",
-                "value": "{\"close\":\"100\"}",
+                "value": price_value("100"),
                 "source": source,
             }),
         ),
@@ -160,7 +176,7 @@ async fn fact_endpoints_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let read: Value = serde_json::from_slice(&body).expect("read JSON");
-    assert_eq!(read["value"], "{\"close\":\"100\"}");
+    assert_eq!(read["value"]["close"], "100");
     assert_eq!(read["source"], source);
 
     // As-known read (the RFC 3339 branch of the instant parser).
@@ -212,7 +228,7 @@ async fn fact_endpoints_round_trip() {
             json!({
                 "valid_at": "2026-02-01",
                 "known_at": "2026-02-02T00:00:00Z",
-                "value": "{\"close\":\"101\"}",
+                "value": price_value("101"),
                 "source": source,
             }),
         ),
@@ -342,7 +358,7 @@ async fn temporal_validation_maps_to_contract_errors() {
             json!({
                 "valid_at": "2026-02-01",
                 "known_at": "not-an-instant",
-                "value": "{}",
+                "value": price_value("100"),
                 "source": "api",
             }),
         ),
@@ -360,7 +376,7 @@ async fn temporal_validation_maps_to_contract_errors() {
             json!({
                 "valid_at": "2026-02-01",
                 "known_at": "2026-02-02T00:00:00Z",
-                "value": "{}",
+                "value": price_value("100"),
                 "source": "api",
             }),
         ),
@@ -422,7 +438,7 @@ async fn temporal_handlers_need_a_database_pool() {
             json!({
                 "valid_at": "2026-02-01",
                 "known_at": "2026-02-02T00:00:00Z",
-                "value": "{}",
+                "value": price_value("100"),
                 "source": "api",
             }),
         ),
@@ -450,6 +466,62 @@ async fn temporal_handlers_need_a_database_pool() {
 }
 
 #[tokio::test]
+async fn catalog_lists_market_price_and_its_typed_fields() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let app = app(Some(pool.clone()));
+
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri("/api/domain/fact-types")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let catalog: Value = serde_json::from_slice(&body).expect("catalog JSON");
+    let types = catalog["fact_types"].as_array().expect("fact_types array");
+    let price = types
+        .iter()
+        .find(|entry| entry["fact_type"] == "market_price")
+        .expect("market_price");
+    assert_eq!(price["storage_kind"], "market_observation");
+    assert_eq!(price["observation_kind"], "eod");
+    assert_eq!(price["interval_seconds"], 0);
+    let fields = price["fields"].as_array().expect("fields");
+    assert_eq!(fields.len(), 8);
+    assert!(
+        fields.iter().any(|field| field["name"] == "close"),
+        "market_price must declare close"
+    );
+}
+
+#[tokio::test]
+async fn series_for_an_unknown_asset_is_a_404_not_an_empty_page() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let app = app(Some(pool.clone()));
+    let missing = Uuid::new_v4();
+
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri(format!(
+                "/api/domain/assets/{missing}/facts/market_price/series?from=2023-01-03T00:00:00Z&to=2026-11-06T00:00:00Z"
+            ))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body).await, "unknown_subject");
+}
+
+#[tokio::test]
 async fn series_returns_resolved_points_and_pages() {
     let Some(pool) = migrated_pool().await else {
         return;
@@ -466,7 +538,7 @@ async fn series_returns_resolved_points_and_pages() {
                 json!({
                     "valid_at": day,
                     "known_at": "2026-01-07T12:00:00Z",
-                    "value": "{\"close\":\"1.00\"}",
+                    "value": price_value("1.00"),
                     "source": "test"
                 })
                 .to_string(),

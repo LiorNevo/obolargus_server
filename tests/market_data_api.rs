@@ -17,14 +17,13 @@ use tower::ServiceExt;
 use obolargus_core::market_data::registry::DataSourceRegistry;
 use obolargus_core::market_data::trait_::MarketDataProvider;
 use obolargus_core::market_data::types::{
-    HistoricalRange, HistoricalRangeRequest, LatestBar, LatestBarRequest, PriceBar,
-    TickerLookupHit, TickerLookupRequest, TickerLookupResult,
+    HistoricalRange, HistoricalRangeRequest, LatestBar, LatestBarRequest, TickerLookupHit,
+    TickerLookupRequest, TickerLookupResult,
 };
 use obolargus_server::config::AppConfig;
 use obolargus_server::{AppState, router};
 
 use async_trait::async_trait;
-use chrono::NaiveDate;
 use rust_decimal::Decimal;
 
 /// A provider that answers the lookup with a fixed hit list.
@@ -384,19 +383,22 @@ fn typed_errors_map_to_http_statuses() {
     }
 }
 
-/// The price-bar payload shape is stable (six fields, decimal prices).
+/// The typed market-price payload carries every OHLCV field as a string.
 #[test]
-fn price_bar_payload_shape_is_stable() {
-    let bar = PriceBar {
-        as_of_date: NaiveDate::from_ymd_opt(2026, 1, 2).expect("date"),
-        open: Decimal::new(100, 0),
-        high: Decimal::new(101, 0),
-        low: Decimal::new(99, 0),
-        close: Decimal::new(100, 0),
-        adjclose: Decimal::new(100, 0),
-        volume: 1_234_567,
-    };
-    let payload = obolargus_core::market_data::refresh::serialize_bar(&bar);
+fn market_price_payload_shape_is_stable() {
+    let value = obolargus_core::temporal::FactValue::MarketPrice(
+        obolargus_core::temporal::MarketPriceValue {
+            open: Decimal::new(100, 0),
+            high: Decimal::new(101, 0),
+            low: Decimal::new(99, 0),
+            close: Decimal::new(100, 0),
+            adjclose: Some(Decimal::new(100, 0)),
+            volume: Some(Decimal::from(1_234_567)),
+            currency: "USD".to_string(),
+            adjustment: obolargus_core::temporal::Adjustment::Unadjusted,
+        },
+    );
+    let payload = serde_json::to_value(&value).expect("json");
     for field in ["open", "high", "low", "close", "adjclose", "volume"] {
         assert!(
             payload.get(field).is_some(),
@@ -404,6 +406,7 @@ fn price_bar_payload_shape_is_stable() {
         );
     }
     assert!(payload["close"].is_string(), "prices are decimal strings");
+    assert_eq!(payload["type"], "market_price");
 }
 
 // ---------------------------------------------------------------------------

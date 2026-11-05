@@ -215,7 +215,8 @@ pub struct ReconcileResponse {
     /// The persisted reconciliation id.
     pub reconciliation_id: Uuid,
     /// The canonical value selected by the policy.
-    pub canonical_value: String,
+    #[schema(value_type = Object)]
+    pub canonical_value: serde_json::Value,
     /// Number of sources consulted.
     pub sources_tried: usize,
 }

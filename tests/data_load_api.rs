@@ -274,6 +274,10 @@ async fn search_migrated_pool() -> Option<sqlx::PgPool> {
         eprintln!("SKIPPED: could not migrate the test database: {error}");
         return None;
     }
+    if let Err(error) = obolargus_core::temporal::catalog::sync_fact_catalog(&pool).await {
+        eprintln!("SKIPPED: could not sync the fact catalog: {error}");
+        return None;
+    }
     Some(pool)
 }
 
