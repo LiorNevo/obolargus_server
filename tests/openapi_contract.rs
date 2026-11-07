@@ -16,6 +16,7 @@ use obolargus_server::openapi_document;
 const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/health"),
     ("get", "/api/assets"),
+    ("get", "/api/domain/schema"),
     ("get", "/api/market-data/sources"),
     ("post", "/api/market-data/refresh"),
     ("get", "/api/market-data/lookup"),
@@ -109,7 +110,10 @@ fn document_has_the_exact_operation_inventory() {
 fn document_uses_the_mount_relative_server_url() {
     let document = document();
 
-    assert_eq!(document["servers"], json!([{ "url": ".." }]));
+    // `../..` cancels the `/swagger-ui/` page segment. Directly this becomes
+    // `/`, and through the gateway it becomes `/obolargus/`, so operation paths
+    // resolve to `/api/...` and `/obolargus/api/...` respectively.
+    assert_eq!(document["servers"], json!([{ "url": "../.." }]));
 
     let serialized = serde_json::to_string(&document).expect("document JSON");
     assert!(
@@ -140,8 +144,9 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 || tag == "market-data"
                 || tag == "temporal"
                 || tag == "domain"
+                || tag == "data-dictionary"
                 || tag == "data-load"),
-            "{method} {path} must carry a health, market-data, temporal, or data-load tag"
+            "{method} {path} must carry a health, market-data, temporal, data-dictionary, or data-load tag"
         );
         assert!(
             operation["summary"]
@@ -225,6 +230,25 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
             );
             assert!(
                 responses["503"]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON error envelope"
+            );
+            continue;
+        }
+
+        // The system data-dictionary export is a static read with its own
+        // schema media type and no database dependency.
+        if *path == "/api/domain/schema" {
+            let expected: BTreeSet<&str> = ["200", "500"].into_iter().collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            assert!(
+                responses["200"]["content"]["application/schema+json"].is_object(),
+                "{method} {path} must document a schema+json success body"
+            );
+            assert!(
+                responses["500"]["content"]["application/json"].is_object(),
                 "{method} {path} must document a JSON error envelope"
             );
             continue;
@@ -426,4 +450,171 @@ fn document_contains_the_expected_schemas_and_shapes() {
         ]),
         "AssetCreation variants must keep the status discriminator"
     );
+}
+
+#[test]
+fn document_exposes_the_system_data_dictionary_for_swagger() {
+    use obolargus_core::data_dictionary::export_system_schema;
+
+    let document = document();
+    let schemas = document["components"]["schemas"]
+        .as_object()
+        .expect("component schemas");
+    let canonical = export_system_schema().expect("system data dictionary");
+    let definitions = canonical.document()["$defs"]
+        .as_object()
+        .expect("data-dictionary definitions");
+
+    for (name, definition) in definitions {
+        let component = format!("DataDictionary.{name}");
+        let projected = schemas
+            .get(&component)
+            .unwrap_or_else(|| panic!("missing data-dictionary component {component}"));
+        assert_eq!(
+            projected,
+            &swagger_projection(definition),
+            "Swagger projection drifted for data-dictionary definition {name}"
+        );
+    }
+
+    for name in schemas
+        .keys()
+        .filter_map(|name| name.strip_prefix("DataDictionary."))
+    {
+        assert!(
+            definitions.contains_key(name),
+            "OpenAPI document contains an invented data-dictionary definition: {name}"
+        );
+    }
+
+    let serialized = serde_json::to_string(&document).expect("document JSON");
+    assert!(
+        !serialized.contains("#/$defs/"),
+        "Swagger-visible definitions must not use document-local $defs references"
+    );
+
+    assert!(
+        document["info"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("../../api/domain/schema")),
+        "info.description must link to the canonical data dictionary"
+    );
+
+    assert_eq!(
+        document["tags"][0]["name"], "data-dictionary",
+        "the data-dictionary tag must be declared first so Swagger UI surfaces it"
+    );
+    let operation = &document["paths"]["/api/domain/schema"]["get"];
+    assert_eq!(
+        operation["tags"],
+        json!(["data-dictionary"]),
+        "the data-dictionary GET must use the dedicated tag"
+    );
+    assert!(
+        operation["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("data dictionary")),
+        "the data-dictionary GET must have an explicit summary"
+    );
+    assert!(
+        operation["responses"]["200"]["content"]["application/schema+json"]["schema"].is_object(),
+        "the GET response must document a JSON Schema body, not a plain string"
+    );
+    assert_eq!(
+        document["x-obolargus-data-dictionary"]["$id"],
+        canonical.document()["$id"]
+    );
+    assert_eq!(
+        document["x-obolargus-data-dictionary"]["x-obolargus-schema-version"],
+        canonical.document()["x-obolargus-schema-version"]
+    );
+    assert_eq!(
+        document["x-obolargus-data-dictionary"]["x-obolargus-relationships"],
+        canonical.document()["x-obolargus-relationships"],
+        "Swagger metadata must preserve the canonical relationships"
+    );
+    assert_eq!(
+        document["x-obolargus-data-dictionary"]["x-obolargus-invariants"],
+        canonical.document()["x-obolargus-invariants"],
+        "Swagger metadata must preserve the canonical invariants"
+    );
+
+    let mut references = Vec::new();
+    collect_references(&document, &mut references);
+    for reference in references {
+        if let Some(name) = reference.strip_prefix("#/components/schemas/") {
+            assert!(
+                schemas.contains_key(name),
+                "unresolved component reference: {reference}"
+            );
+        }
+    }
+}
+
+/// Reproduces the documented Swagger projection so the test fails when the
+/// production projection changes: prefix `$defs` references, and render JSON
+/// Schema `const` as the equivalent single-value `enum`.
+fn swagger_projection(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut projected = serde_json::Map::new();
+            for (key, item) in object {
+                match key.as_str() {
+                    "$ref" => {
+                        let reference = item.as_str().map_or_else(
+                            || item.clone(),
+                            |reference| match reference.strip_prefix("#/$defs/") {
+                                Some(name) => Value::String(format!(
+                                    "#/components/schemas/DataDictionary.{name}"
+                                )),
+                                None => item.clone(),
+                            },
+                        );
+                        projected.insert(key.clone(), reference);
+                    }
+                    "const" => {
+                        projected.insert(
+                            "type".to_string(),
+                            json!(match item {
+                                Value::Null => "null",
+                                Value::Bool(_) => "boolean",
+                                Value::Number(_) => "number",
+                                Value::String(_) => "string",
+                                Value::Array(_) => "array",
+                                Value::Object(_) => "object",
+                            }),
+                        );
+                        projected.insert("enum".to_string(), json!([item]));
+                    }
+                    _ => {
+                        projected.insert(key.clone(), swagger_projection(item));
+                    }
+                }
+            }
+            Value::Object(projected)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(swagger_projection).collect()),
+        other => other.clone(),
+    }
+}
+
+fn collect_references(value: &Value, references: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, item) in object {
+                if key == "$ref"
+                    && let Some(reference) = item.as_str()
+                {
+                    references.push(reference.to_string());
+                }
+                collect_references(item, references);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_references(item, references);
+            }
+        }
+        _ => {}
+    }
 }

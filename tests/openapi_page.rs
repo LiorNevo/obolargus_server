@@ -75,7 +75,22 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
     let document: Value = serde_json::from_str(&body).expect("valid JSON document");
     assert_eq!(document["openapi"], "3.1.0");
     assert_eq!(document["info"]["title"], "Obolargus API");
-    assert_eq!(document["servers"], serde_json::json!([{ "url": ".." }]));
+    assert_eq!(document["servers"], serde_json::json!([{ "url": "../.." }]));
+    assert!(
+        document["info"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("../../api/domain/schema")),
+        "the served document must link to the canonical data dictionary"
+    );
+    assert!(
+        document["components"]["schemas"]["DataDictionary.Asset"].is_object(),
+        "the served document must expose the data dictionary in Swagger UI"
+    );
+    assert_eq!(
+        document["paths"]["/api/domain/schema"]["get"]["tags"],
+        serde_json::json!(["data-dictionary"]),
+        "the served document must expose a dedicated data-dictionary GET operation"
+    );
 
     let mut paths: Vec<&str> = document["paths"]
         .as_object()
@@ -97,6 +112,7 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
             "/api/data-load/sources",
             "/api/data-load/sources/{source_id}",
             "/api/domain/fact-types",
+            "/api/domain/schema",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",

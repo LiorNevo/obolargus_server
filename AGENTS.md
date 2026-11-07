@@ -18,14 +18,24 @@ Operational rules for contributors and AI agents working in this crate.
 - Config behavior must honor `contracts/config-contract.md` (`AUTH_ENABLED`
   without `JWT_SECRET` fails fast).
 - Wire behavior is covered by integration tests; keep the boot test green.
+- `GET /api/domain/schema` serves the canonical system data-dictionary
+  schema as `application/schema+json; charset=utf-8` and must work with
+  `AppState.pool = None`.
+- The OpenAPI document projects the canonical data dictionary into
+  `components.schemas` under the `DataDictionary.` prefix so Swagger UI can
+  browse it. Keep that projection generated from
+  `obolargus_core::data_dictionary::export_system_schema()`; never hand-author
+  data-dictionary definitions in the OpenAPI document.
 - Every public API route MUST be registered through `api_router()` with
   `utoipa_axum::routes!(...)`. Do not add API endpoints with a plain
   `Router::route`; that would omit them from the OpenAPI document. The
   documentation and redirect routes in `docs.rs` are the only exempt
   surfaces.
 - Keep documentation URLs mount-relative (`../api-docs/openapi.json`,
-  `servers: [{ "url": ".." }]`); never introduce absolute `http://` URLs or
-  internal host/port values into the document or page.
+  `servers: [{ "url": "../.." }]`, `../../api/domain/schema`); never introduce
+  absolute `http://` URLs or internal host/port values into the document or
+  page. The business-API proxy strips only `/obolargus`, so the extra `..`
+  leaves gateway requests at `/obolargus/api/...`.
 
 ## Commands
 

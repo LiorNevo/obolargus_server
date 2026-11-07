@@ -103,6 +103,7 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
 
     OpenApiRouter::new()
         .routes(routes!(routes::health::health))
+        .routes(routes!(routes::domain::get_schema))
         .routes(routes!(routes::assets::search_assets))
         .routes(routes!(routes::market_data::list_sources))
         .routes(routes!(routes::market_data::refresh))
@@ -129,10 +130,11 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
 
 /// Returns the OpenAPI 3.1 document generated from [`api_router`].
 ///
-/// The document uses a mount-relative server URL (`..`) so "Try it out"
-/// requests resolve to the host and mount that served the document: the
-/// server root when accessed directly, or `/obolargus/api/` through the
-/// gateway.
+/// The document uses a mount-relative server URL (`../..`) so "Try it out"
+/// requests resolve to the host and mount that served the document. The extra
+/// level cancels the Swagger UI page's `swagger-ui/` segment: directly the
+/// server sees `/api/...`, and through the gateway the request is
+/// `/obolargus/api/...`, which the gateway forwards as `/api/...`.
 pub fn openapi_document() -> utoipa::openapi::OpenApi {
     let (_, document) = api_router().split_for_parts();
     with_document_metadata(document)
@@ -141,15 +143,28 @@ pub fn openapi_document() -> utoipa::openapi::OpenApi {
 /// Applies the public service metadata and mount-relative server URL.
 fn with_document_metadata(mut document: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
     use utoipa::openapi::server::Server;
+    use utoipa::openapi::tag::Tag;
 
     document.info.title = "Obolargus API".to_string();
     document.info.version = env!("CARGO_PKG_VERSION").to_string();
-    document.info.description = Some(
-        "REST API for Obolargus. Interactive documentation: [Swagger UI](/swagger-ui/)."
+    document.info.description = Some(format!(
+        "REST API for Obolargus. Interactive documentation: [Swagger UI](/swagger-ui/). \
+         Persisted-data dictionary: [JSON Schema]({}).",
+        docs::DATA_DICTIONARY_URL
+    ));
+    document.servers = Some(vec![Server::new("../..")]);
+
+    let mut data_dictionary = Tag::new("data-dictionary");
+    data_dictionary.summary = Some("System data dictionary".to_string());
+    data_dictionary.description = Some(
+        "Retrieve the complete persisted-data contract as one JSON Schema 2020-12 \
+         document, then browse every entity, fact type, field, relationship, and \
+         invariant in the Schemas section."
             .to_string(),
     );
-    document.servers = Some(vec![Server::new("..")]);
-    document
+    document.tags = Some(vec![data_dictionary]);
+
+    docs::with_data_dictionary(document)
 }
 
 fn cors_origins(config: &AppConfig) -> Vec<HeaderValue> {
