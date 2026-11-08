@@ -43,3 +43,14 @@ Operational rules for contributors and AI agents working in this crate.
 - Lint: `cargo clippy --all-targets -- -D warnings`
 - Coverage: `cargo llvm-cov --all-targets --no-fail-fast`
 - Boot the skeleton: `cargo run` (then `curl localhost:8000/health`).
+
+## Automation (spec 030)
+
+- `src/automation/` owns the run executor, scheduler, audit actor, and SSE
+  projection; `src/routes/automation/` owns the HTTP surface.
+- Every automation route must be registered with `utoipa_axum::routes!` and
+  covered by `tests/automation_api_contract.rs`.
+- The scheduler applies overlap (`skip`, `queue`, `cancel_previous`) and missed
+  (`run_once`, `skip`) policies; record decisions in audit events.
+- Database-backed automation tests self-skip unless `TEST_DATABASE_URL` or
+  `DATABASE_URL` is set.

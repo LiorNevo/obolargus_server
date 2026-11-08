@@ -321,6 +321,7 @@ async fn http_range_load_groups_rows_and_reports_progress() {
         config: AppConfig::default(),
         pool: Some(pool.clone()),
         market_data: registry,
+        automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
     };
     let group_id = Uuid::new_v4();
     let body = format!(
@@ -402,6 +403,7 @@ async fn http_async_range_load_returns_202_and_progress_completes() {
         config: AppConfig::default(),
         pool: Some(pool.clone()),
         market_data: registry,
+        automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
     };
     let group_id = Uuid::new_v4();
     let body = format!(
@@ -482,6 +484,7 @@ async fn http_single_date_load_reports_stored_provenance() {
         config: AppConfig::default(),
         pool: Some(pool),
         market_data: registry,
+        automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
     };
     let response = router(state)
         .oneshot(
@@ -521,6 +524,7 @@ fn state_with_pool(pool: sqlx::PgPool, source_id: &str) -> AppState {
         config: AppConfig::default(),
         pool: Some(pool),
         market_data: registry,
+        automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
     }
 }
 

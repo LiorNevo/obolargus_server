@@ -104,6 +104,77 @@ pub struct AppConfig {
     /// A running history entry older than this is labelled incomplete.
     #[envconfig(from = "DATA_LOAD_STALE_AFTER_SECONDS", default = "7200")]
     pub data_load_stale_after_seconds: i64,
+
+    // ---- Automation flow engine (spec 030) ----
+    /// Enables automation routes and background loops.
+    #[envconfig(from = "AUTOMATION_ENABLED", default = "true")]
+    pub automation_enabled: bool,
+    /// Actor recorded in automation audit/run metadata (no auth in v1).
+    #[envconfig(from = "AUTOMATION_ACTOR_ID", default = "dev-user")]
+    pub automation_actor_id: String,
+    /// Run/message/log retention in days.
+    #[envconfig(from = "AUTOMATION_RUN_RETENTION_DAYS", default = "90")]
+    pub automation_run_retention_days: u32,
+    /// Audit retention in days.
+    #[envconfig(from = "AUTOMATION_AUDIT_RETENTION_DAYS", default = "365")]
+    pub automation_audit_retention_days: u32,
+    /// Global concurrent run limit.
+    #[envconfig(from = "AUTOMATION_MAX_CONCURRENT_RUNS", default = "10")]
+    pub automation_max_concurrent_runs: u32,
+    /// Per-flow concurrent run limit.
+    #[envconfig(from = "AUTOMATION_MAX_CONCURRENT_RUNS_PER_FLOW", default = "1")]
+    pub automation_max_concurrent_runs_per_flow: u32,
+    /// Schedule poll cadence in seconds.
+    #[envconfig(from = "AUTOMATION_SCHEDULER_INTERVAL_SECONDS", default = "30")]
+    pub automation_scheduler_interval_seconds: u64,
+    /// SSE database poll cadence in milliseconds.
+    #[envconfig(from = "AUTOMATION_SSE_POLL_INTERVAL_MS", default = "1000")]
+    pub automation_sse_poll_interval_ms: u64,
+    /// Maximum SSE stream duration in seconds.
+    #[envconfig(from = "AUTOMATION_SSE_MAX_DURATION_SECONDS", default = "3600")]
+    pub automation_sse_max_duration_seconds: u64,
+    /// Maximum concurrent SSE streams per actor.
+    #[envconfig(from = "AUTOMATION_MAX_SSE_STREAMS", default = "10")]
+    pub automation_max_sse_streams: u32,
+    /// Maximum flow JSON size in bytes.
+    #[envconfig(from = "AUTOMATION_MAX_FLOW_BYTES", default = "1048576")]
+    pub automation_max_flow_bytes: usize,
+    /// Maximum run input size in bytes.
+    #[envconfig(from = "AUTOMATION_MAX_INPUT_BYTES", default = "1048576")]
+    pub automation_max_input_bytes: usize,
+    /// Maximum single message size in bytes.
+    #[envconfig(from = "AUTOMATION_MAX_MESSAGE_BYTES", default = "1048576")]
+    pub automation_max_message_bytes: usize,
+    /// Maximum inline node output size in bytes.
+    #[envconfig(from = "AUTOMATION_MAX_OUTPUT_BYTES", default = "1048576")]
+    pub automation_max_output_bytes: usize,
+    /// Maximum context value size in bytes.
+    #[envconfig(from = "AUTOMATION_MAX_CONTEXT_BYTES", default = "262144")]
+    pub automation_max_context_bytes: usize,
+    /// Comma-separated capability allowlist (`all` for every built-in).
+    #[envconfig(from = "AUTOMATION_ENABLED_CAPABILITIES", default = "all")]
+    pub automation_enabled_capabilities: String,
+    /// Loop protection: maximum messages per run.
+    #[envconfig(from = "AUTOMATION_MAX_MESSAGES_PER_RUN", default = "10000")]
+    pub automation_max_messages_per_run: u64,
+    /// Loop protection: maximum messages per node.
+    #[envconfig(from = "AUTOMATION_MAX_MESSAGES_PER_NODE", default = "1000")]
+    pub automation_max_messages_per_node: u64,
+    /// Loop protection: maximum run duration in seconds.
+    #[envconfig(from = "AUTOMATION_MAX_RUN_DURATION_SECONDS", default = "3600")]
+    pub automation_max_run_duration_seconds: u64,
+    /// Maximum subflow nesting depth.
+    #[envconfig(from = "AUTOMATION_MAX_SUBFLOW_DEPTH", default = "10")]
+    pub automation_max_subflow_depth: u32,
+    /// Run quiescence window in milliseconds.
+    #[envconfig(from = "AUTOMATION_IDLE_TIMEOUT_MS", default = "2000")]
+    pub automation_idle_timeout_ms: u64,
+    /// Debug message buffer per run.
+    #[envconfig(from = "AUTOMATION_DEBUG_BUFFER_SIZE", default = "1000")]
+    pub automation_debug_buffer_size: usize,
+    /// API trigger rate limit per minute.
+    #[envconfig(from = "AUTOMATION_API_TRIGGER_RATE_LIMIT_PER_MINUTE", default = "60")]
+    pub automation_api_trigger_rate_limit_per_minute: u32,
 }
 
 impl Default for AppConfig {
@@ -138,6 +209,29 @@ impl Default for AppConfig {
             temporal_retention_archive_days: 365,
             temporal_price_source_policy: "priority".to_string(),
             data_load_stale_after_seconds: 7_200,
+            automation_enabled: true,
+            automation_actor_id: "dev-user".to_string(),
+            automation_run_retention_days: 90,
+            automation_audit_retention_days: 365,
+            automation_max_concurrent_runs: 10,
+            automation_max_concurrent_runs_per_flow: 1,
+            automation_scheduler_interval_seconds: 30,
+            automation_sse_poll_interval_ms: 1_000,
+            automation_sse_max_duration_seconds: 3_600,
+            automation_max_sse_streams: 10,
+            automation_max_flow_bytes: 1_048_576,
+            automation_max_input_bytes: 1_048_576,
+            automation_max_message_bytes: 1_048_576,
+            automation_max_output_bytes: 1_048_576,
+            automation_max_context_bytes: 262_144,
+            automation_enabled_capabilities: "all".to_string(),
+            automation_max_messages_per_run: 10_000,
+            automation_max_messages_per_node: 1_000,
+            automation_max_run_duration_seconds: 3_600,
+            automation_max_subflow_depth: 10,
+            automation_idle_timeout_ms: 2_000,
+            automation_debug_buffer_size: 1_000,
+            automation_api_trigger_rate_limit_per_minute: 60,
         }
     }
 }
@@ -218,6 +312,101 @@ impl AppConfig {
         if self.data_load_stale_after_seconds <= 0 {
             return Err(ConfigError::Load(
                 "DATA_LOAD_STALE_AFTER_SECONDS must be >= 1".to_string(),
+            ));
+        }
+        self.validate_automation()?;
+        Ok(())
+    }
+
+    /// Fail-fast validation for the spec-030 automation keys.
+    fn validate_automation(&self) -> Result<(), ConfigError> {
+        if self.automation_actor_id.trim().is_empty() {
+            return Err(ConfigError::Load(
+                "AUTOMATION_ACTOR_ID must be non-empty".to_string(),
+            ));
+        }
+        for (name, value) in [
+            (
+                "AUTOMATION_MAX_CONCURRENT_RUNS",
+                self.automation_max_concurrent_runs,
+            ),
+            (
+                "AUTOMATION_MAX_CONCURRENT_RUNS_PER_FLOW",
+                self.automation_max_concurrent_runs_per_flow,
+            ),
+            (
+                "AUTOMATION_MAX_SSE_STREAMS",
+                self.automation_max_sse_streams,
+            ),
+            (
+                "AUTOMATION_API_TRIGGER_RATE_LIMIT_PER_MINUTE",
+                self.automation_api_trigger_rate_limit_per_minute,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Load(format!("{name} must be >= 1")));
+            }
+        }
+        for (name, value) in [
+            (
+                "AUTOMATION_SCHEDULER_INTERVAL_SECONDS",
+                self.automation_scheduler_interval_seconds,
+            ),
+            (
+                "AUTOMATION_SSE_POLL_INTERVAL_MS",
+                self.automation_sse_poll_interval_ms,
+            ),
+            (
+                "AUTOMATION_MAX_MESSAGES_PER_RUN",
+                self.automation_max_messages_per_run,
+            ),
+            (
+                "AUTOMATION_MAX_MESSAGES_PER_NODE",
+                self.automation_max_messages_per_node,
+            ),
+            (
+                "AUTOMATION_MAX_RUN_DURATION_SECONDS",
+                self.automation_max_run_duration_seconds,
+            ),
+            (
+                "AUTOMATION_IDLE_TIMEOUT_MS",
+                self.automation_idle_timeout_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Load(format!("{name} must be >= 1")));
+            }
+        }
+        for (name, value) in [
+            ("AUTOMATION_MAX_FLOW_BYTES", self.automation_max_flow_bytes),
+            (
+                "AUTOMATION_MAX_INPUT_BYTES",
+                self.automation_max_input_bytes,
+            ),
+            (
+                "AUTOMATION_MAX_MESSAGE_BYTES",
+                self.automation_max_message_bytes,
+            ),
+            (
+                "AUTOMATION_MAX_OUTPUT_BYTES",
+                self.automation_max_output_bytes,
+            ),
+            (
+                "AUTOMATION_MAX_CONTEXT_BYTES",
+                self.automation_max_context_bytes,
+            ),
+            (
+                "AUTOMATION_DEBUG_BUFFER_SIZE",
+                self.automation_debug_buffer_size,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Load(format!("{name} must be >= 1")));
+            }
+        }
+        if self.automation_max_subflow_depth == 0 {
+            return Err(ConfigError::Load(
+                "AUTOMATION_MAX_SUBFLOW_DEPTH must be >= 1".to_string(),
             ));
         }
         Ok(())

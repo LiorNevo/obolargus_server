@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod automation;
 pub mod config;
 pub mod docs;
 pub mod market_data_provider;
@@ -34,6 +35,8 @@ pub struct AppState {
     /// Source-agnostic market data registry. Always present (built from the
     /// default Yahoo config when `MARKET_DATA_SOURCES` is unset).
     pub market_data: Arc<obolargus_core::market_data::registry::DataSourceRegistry>,
+    /// Automation node registry and per-run cancellation handles.
+    pub automation: Arc<automation::state::AutomationState>,
 }
 
 impl AppState {
@@ -47,10 +50,14 @@ impl AppState {
         pool: Option<PgPool>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let market_data = build_market_data_registry(&config)?;
+        let automation = Arc::new(automation::state::AutomationState::with_capabilities(
+            &config.automation_enabled_capabilities,
+        ));
         Ok(Self {
             config,
             pool,
             market_data,
+            automation,
         })
     }
 
@@ -68,10 +75,14 @@ impl AppState {
             .map_err(|e| format!("market data config: {e}"))?;
         let market_data =
             tasks::build_registry_and_persist(&market_data_config, pool.as_ref()).await?;
+        let automation = Arc::new(automation::state::AutomationState::with_capabilities(
+            &config.automation_enabled_capabilities,
+        ));
         Ok(Self {
             config,
             pool,
             market_data,
+            automation,
         })
     }
 }
@@ -126,6 +137,41 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::temporal::retract_fact_handler))
         .routes(routes!(routes::temporal::fact_history_handler))
         .routes(routes!(routes::temporal::fact_series_handler))
+        .routes(routes!(routes::automation::catalog::list_node_types))
+        .routes(routes!(routes::automation::catalog::list_templates))
+        .routes(routes!(routes::automation::catalog::get_template))
+        .routes(routes!(routes::automation::flows::list_flows))
+        .routes(routes!(routes::automation::flows::create_flow))
+        .routes(routes!(routes::automation::flows::get_flow))
+        .routes(routes!(routes::automation::flows::update_flow))
+        .routes(routes!(routes::automation::flows::archive_flow))
+        .routes(routes!(routes::automation::flows::restore_flow))
+        .routes(routes!(routes::automation::flows::delete_flow))
+        .routes(routes!(routes::automation::flows::save_draft))
+        .routes(routes!(routes::automation::flows::validate))
+        .routes(routes!(routes::automation::flows::get_context))
+        .routes(routes!(routes::automation::flows::delete_context))
+        .routes(routes!(routes::automation::versions::publish))
+        .routes(routes!(routes::automation::versions::list_versions))
+        .routes(routes!(routes::automation::versions::get_version))
+        .routes(routes!(routes::automation::versions::archive_version))
+        .routes(routes!(routes::automation::versions::export_version))
+        .routes(routes!(routes::automation::versions::import_flow))
+        .routes(routes!(routes::automation::runs::start_run))
+        .routes(routes!(routes::automation::runs::list_runs))
+        .routes(routes!(routes::automation::runs::get_run))
+        .routes(routes!(routes::automation::runs::get_node))
+        .routes(routes!(routes::automation::runs::cancel_run))
+        .routes(routes!(routes::automation::runs::retry_run))
+        .routes(routes!(routes::automation::messages::list_messages))
+        .routes(routes!(routes::automation::messages::list_logs))
+        .routes(routes!(routes::automation::triggers::list_triggers))
+        .routes(routes!(routes::automation::triggers::create_trigger))
+        .routes(routes!(routes::automation::triggers::update_trigger))
+        .routes(routes!(routes::automation::triggers::delete_trigger))
+        .routes(routes!(routes::automation::triggers::invoke_trigger))
+        .routes(routes!(routes::automation::audit::list_audit))
+        .routes(routes!(routes::automation::events::stream_events))
 }
 
 /// Returns the OpenAPI 3.1 document generated from [`api_router`].
@@ -236,6 +282,14 @@ pub async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error + 
 
     let state = AppState::new_with_persistence(config.clone(), pool).await?;
 
+    if let Some(pool) = state.pool.as_ref() {
+        match obolargus_core::automation::runtime::persistence::mark_interrupted_runs(pool).await {
+            Ok(0) => {}
+            Ok(count) => tracing::warn!(count, "marked stale automation runs interrupted"),
+            Err(error) => tracing::warn!(%error, "could not mark stale automation runs"),
+        }
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     if config.run_scheduled_tasks {
         let task_state = state.clone();
@@ -244,6 +298,13 @@ pub async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error + 
             if let Err(error) = tasks::run(task_state, task_shutdown).await {
                 tracing::error!(%error, "scheduler exited with error");
             }
+        });
+    }
+    if config.automation_enabled {
+        let automation_state = state.clone();
+        let automation_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            automation::scheduler::run(automation_state, automation_shutdown).await;
         });
     }
 

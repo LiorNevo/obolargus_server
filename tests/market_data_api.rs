@@ -95,6 +95,7 @@ fn state_with(providers: Vec<LookupProvider>) -> AppState {
         config: AppConfig::default(),
         pool: None,
         market_data: std::sync::Arc::new(registry),
+        automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
     }
 }
 

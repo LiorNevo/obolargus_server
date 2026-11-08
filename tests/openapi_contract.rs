@@ -53,6 +53,50 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
         "get",
         "/api/domain/{subject}/{subject_id}/facts/{fact_type}/series",
     ),
+    ("delete", "/api/automation/flows/{flow_id}"),
+    ("delete", "/api/automation/flows/{flow_id}/context"),
+    ("delete", "/api/automation/triggers/{trigger_id}"),
+    ("get", "/api/automation/flows"),
+    ("get", "/api/automation/flows/{flow_id}"),
+    ("get", "/api/automation/flows/{flow_id}/audit"),
+    ("get", "/api/automation/flows/{flow_id}/context"),
+    ("get", "/api/automation/flows/{flow_id}/triggers"),
+    ("get", "/api/automation/flows/{flow_id}/versions"),
+    (
+        "get",
+        "/api/automation/flows/{flow_id}/versions/{version_number}",
+    ),
+    (
+        "get",
+        "/api/automation/flows/{flow_id}/versions/{version_number}/export",
+    ),
+    ("get", "/api/automation/node-types"),
+    ("get", "/api/automation/runs"),
+    ("get", "/api/automation/runs/{run_id}"),
+    ("get", "/api/automation/runs/{run_id}/events"),
+    ("get", "/api/automation/runs/{run_id}/logs"),
+    ("get", "/api/automation/runs/{run_id}/messages"),
+    ("get", "/api/automation/runs/{run_id}/nodes/{node_id}"),
+    ("get", "/api/automation/templates"),
+    ("get", "/api/automation/templates/{template_id}"),
+    ("patch", "/api/automation/flows/{flow_id}"),
+    ("patch", "/api/automation/triggers/{trigger_id}"),
+    ("post", "/api/automation/flows"),
+    ("post", "/api/automation/flows/{flow_id}/archive"),
+    ("post", "/api/automation/flows/{flow_id}/import"),
+    ("post", "/api/automation/flows/{flow_id}/publish"),
+    ("post", "/api/automation/flows/{flow_id}/restore"),
+    ("post", "/api/automation/flows/{flow_id}/runs"),
+    ("post", "/api/automation/flows/{flow_id}/triggers"),
+    ("post", "/api/automation/flows/{flow_id}/validate"),
+    (
+        "post",
+        "/api/automation/flows/{flow_id}/versions/{version_number}/archive",
+    ),
+    ("post", "/api/automation/runs/{run_id}/cancel"),
+    ("post", "/api/automation/runs/{run_id}/retry"),
+    ("post", "/api/automation/triggers/{trigger_id}/invoke"),
+    ("put", "/api/automation/flows/{flow_id}/draft"),
 ];
 
 fn document() -> Value {
@@ -145,8 +189,9 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 || tag == "temporal"
                 || tag == "domain"
                 || tag == "data-dictionary"
-                || tag == "data-load"),
-            "{method} {path} must carry a health, market-data, temporal, data-dictionary, or data-load tag"
+                || tag == "data-load"
+                || tag == "automation"),
+            "{method} {path} must carry a known tag"
         );
         assert!(
             operation["summary"]
@@ -208,6 +253,29 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 "{method} {path} must document a JSON success body"
             );
             for status in expected.iter().filter(|status| **status != "200") {
+                assert!(
+                    responses[*status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON error envelope"
+                );
+            }
+            continue;
+        }
+
+        // Automation operations document their success response and a small
+        // JSON error set. Validate the success body and envelope shape rather
+        // than pinning every handler-specific status combination.
+        if path.starts_with("/api/automation/") {
+            let success = statuses
+                .iter()
+                .find(|status| status.starts_with('2'))
+                .unwrap_or_else(|| panic!("{method} {path} has no success status"));
+            if *success != "204" && !path.ends_with("/events") {
+                assert!(
+                    responses[*success]["content"]["application/json"].is_object(),
+                    "{method} {path} must document a JSON success body"
+                );
+            }
+            for status in statuses.iter().filter(|status| !status.starts_with('2')) {
                 assert!(
                     responses[*status]["content"]["application/json"].is_object(),
                     "{method} {path} {status} must document a JSON error envelope"
