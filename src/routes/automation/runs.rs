@@ -361,6 +361,25 @@ pub async fn create_run(
             error.to_string(),
         )
     })?;
+    if let Some(inject_node_id) = body.inject_node_id.as_deref() {
+        match document.nodes.iter().find(|node| node.id == inject_node_id) {
+            None => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "validation_error",
+                    "run.inject_node_not_found",
+                ));
+            }
+            Some(node) if node.node_type != "inject" => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "validation_error",
+                    "run.inject_node_invalid",
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     let mut inputs = if body.inputs.is_null() {
         json!({})
     } else {

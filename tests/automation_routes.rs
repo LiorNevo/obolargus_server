@@ -77,6 +77,23 @@ async fn versions_are_immutable_and_runs_pin_the_published_version() {
     let v2 = publish(&state, &flow_id, revision).await;
     assert_eq!(v2["version_number"], 2);
 
+    // Publishing snapshots the draft but keeps it as the editable working
+    // copy, and the flow detail exposes the published document for flows
+    // that have no draft.
+    let (status, detail) = send(
+        state.clone(),
+        Method::GET,
+        &format!("/api/automation/flows/{flow_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["draft"]["flow_json"]["name"], "versions v2");
+    assert_eq!(
+        detail["current_version"]["flow_json"]["name"],
+        "versions v2"
+    );
+
     let (status, versions) = send(
         state.clone(),
         Method::GET,

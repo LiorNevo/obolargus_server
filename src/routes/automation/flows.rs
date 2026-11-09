@@ -78,6 +78,10 @@ pub struct CurrentVersionView {
     pub published_at: Option<DateTime<Utc>>,
     /// Change note.
     pub change_note: Option<String>,
+    /// Canonical document of the published version, so a flow without a
+    /// draft can be opened from its current version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_json: Option<Value>,
 }
 
 /// Flow detail.
@@ -181,6 +185,7 @@ async fn flow_detail(
                 version_number: number,
                 published_at: version.published_at,
                 change_note: version.change_note,
+                flow_json: Some(version.flow_json),
             })
         }),
         created_at: flow.created_at,
