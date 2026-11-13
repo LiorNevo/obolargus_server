@@ -89,7 +89,11 @@ pub async fn execute_run(state: AppState, run_id: Uuid) -> Result<(), Automation
 
     let token = CancellationToken::new();
     state.automation.register_cancel(run_id, token.clone());
-    if run.cancel_requested_at.is_some() {
+    // Re-read the cancellation flag after registering the token: the cancel
+    // route may have run between the initial load and `register_cancel`, in
+    // which case its in-process lookup found no token to cancel.
+    let latest = persistence::get_run(&pool, run_id).await?;
+    if latest.cancel_requested_at.is_some() {
         token.cancel();
     }
     let heartbeat_pool = pool.clone();
