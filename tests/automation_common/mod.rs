@@ -47,6 +47,7 @@ pub async fn migrated_pool() -> Option<sqlx::PgPool> {
 }
 
 /// Builds application state, clamping optional config overrides.
+#[allow(dead_code)]
 pub fn state(pool: Option<sqlx::PgPool>) -> AppState {
     AppState::new(AppConfig::default(), pool).expect("app state")
 }

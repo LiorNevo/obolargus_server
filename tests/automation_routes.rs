@@ -27,6 +27,7 @@ fn valid_flow(name: &str) -> Value {
 }
 
 async fn create_flow(state: &obolargus_server::AppState, name: &str) -> String {
+    let name = format!("{name} {}", uuid::Uuid::new_v4());
     let (status, created) = send(
         state.clone(),
         Method::POST,
@@ -163,11 +164,21 @@ async fn export_import_round_trips_known_nodes_and_reports_unknown_types() {
     assert_eq!(exported["name"], "export v1");
 
     let target = create_flow(&state, "import").await;
-    let (status, imported) = send(
+    let (status, conflict) = send(
         state.clone(),
         Method::POST,
         &format!("/api/automation/flows/{target}/import"),
         Some(json!({ "flow_json": exported })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["message"], "draft.exists");
+
+    let (status, imported) = send(
+        state.clone(),
+        Method::POST,
+        &format!("/api/automation/flows/{target}/import"),
+        Some(json!({ "flow_json": exported, "replace_draft": true })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{imported}");

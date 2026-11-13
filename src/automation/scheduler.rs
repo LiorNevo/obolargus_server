@@ -222,3 +222,305 @@ async fn active_run_ids(
     .await
     .map_err(|error| AutomationError::Infrastructure(error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    use crate::config::AppConfig;
+
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        sqlx::migrate!("../obolargus_core/migrations")
+            .run(&pool)
+            .await
+            .ok()?;
+        Some(pool)
+    }
+
+    async fn make_flow(pool: &sqlx::PgPool, owner: &str) -> (Uuid, Uuid) {
+        let document = json!({
+            "schema_version": 1,
+            "name": format!("scheduler-{}", Uuid::new_v4()),
+            "nodes": [
+                { "id": "n1", "type": "inject", "type_version": 1, "config": { "repeat": "none", "once": true } },
+                { "id": "n2", "type": "debug", "type_version": 1, "config": { "target": "msg" } }
+            ],
+            "wires": [
+                { "id": "w1", "source": "n1", "source_port": "out", "target": "n2", "target_port": "in" }
+            ]
+        });
+        let name = format!("scheduler-{}", Uuid::new_v4());
+        let flow = persistence::create_flow(pool, owner, &name, "", &[], &document)
+            .await
+            .expect("create flow");
+        let version = persistence::publish_flow(pool, flow.id, flow.draft_revision, "test", owner)
+            .await
+            .expect("publish flow");
+        (flow.id, version.id)
+    }
+
+    async fn insert_trigger(
+        pool: &sqlx::PgPool,
+        flow_id: Uuid,
+        version_id: Uuid,
+        next_occurrence_at: DateTime<Utc>,
+        missed_policy: &str,
+    ) -> TriggerRecord {
+        let trigger = persistence::insert_inject_trigger(
+            pool,
+            flow_id,
+            version_id,
+            "n1",
+            "interval",
+            Some(60),
+            None,
+            "UTC",
+            next_occurrence_at,
+            "test",
+        )
+        .await
+        .expect("insert trigger");
+        persistence::update_trigger(pool, trigger.id, None, None, Some(missed_policy))
+            .await
+            .expect("update trigger")
+    }
+
+    fn manual_trigger(flow_id: Uuid) -> TriggerRecord {
+        let now = Utc::now();
+        TriggerRecord {
+            id: Uuid::new_v4(),
+            flow_id,
+            flow_version_id: None,
+            node_id: Some("n1".to_string()),
+            kind: "inject".to_string(),
+            enabled: true,
+            repeat_kind: Some("interval".to_string()),
+            interval_seconds: Some(60),
+            cron_expression: None,
+            timezone: "UTC".to_string(),
+            overlap_policy: "queue".to_string(),
+            missed_policy: "run_once".to_string(),
+            next_occurrence_at: Some(now + ChronoDuration::minutes(1)),
+            last_occurrence_at: None,
+            created_by: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_paths_cover_missed_overlap_limits_and_ticks() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let state = AppState::new(AppConfig::default(), Some(pool.clone())).expect("app state");
+        let owner = state.config.automation_actor_id.clone();
+
+        // A missed `skip` occurrence advances without firing.
+        let (flow_id, version_id) = make_flow(&pool, &owner).await;
+        let trigger = insert_trigger(
+            &pool,
+            flow_id,
+            version_id,
+            Utc::now() - ChronoDuration::minutes(5),
+            "skip",
+        )
+        .await;
+        fire(&state, &trigger).await.expect("missed skip");
+        let advanced = persistence::get_trigger(&pool, trigger.id)
+            .await
+            .expect("advanced trigger");
+        assert!(
+            advanced.next_occurrence_at.expect("next occurrence") > Utc::now(),
+            "missed skip must advance the schedule"
+        );
+        assert!(
+            persistence::latest_run(&pool, flow_id)
+                .await
+                .expect("latest run")
+                .is_none(),
+            "missed skip must not create a run"
+        );
+
+        // The global concurrency cap rejects the tick.
+        let zero_global = AppState::new(
+            AppConfig {
+                automation_max_concurrent_runs: 0,
+                ..AppConfig::default()
+            },
+            Some(pool.clone()),
+        )
+        .expect("zero global state");
+        let (flow_id, version_id) = make_flow(&pool, &owner).await;
+        let trigger = insert_trigger(
+            &pool,
+            flow_id,
+            version_id,
+            Utc::now() + ChronoDuration::minutes(1),
+            "run_once",
+        )
+        .await;
+        fire(&zero_global, &trigger).await.expect("queue rejection");
+        assert!(
+            persistence::latest_run(&pool, flow_id)
+                .await
+                .expect("latest run")
+                .is_none()
+        );
+
+        // The per-flow concurrency cap rejects the tick as well.
+        let zero_flow = AppState::new(
+            AppConfig {
+                automation_max_concurrent_runs: 100,
+                automation_max_concurrent_runs_per_flow: 0,
+                ..AppConfig::default()
+            },
+            Some(pool.clone()),
+        )
+        .expect("zero flow state");
+        let (flow_id, version_id) = make_flow(&pool, &owner).await;
+        let trigger = insert_trigger(
+            &pool,
+            flow_id,
+            version_id,
+            Utc::now() + ChronoDuration::minutes(1),
+            "run_once",
+        )
+        .await;
+        fire(&zero_flow, &trigger)
+            .await
+            .expect("flow queue rejection");
+        assert!(
+            persistence::latest_run(&pool, flow_id)
+                .await
+                .expect("latest run")
+                .is_none()
+        );
+
+        // An active run causes `skip` to advance without firing.
+        let overlap_state = AppState::new(
+            AppConfig {
+                automation_max_concurrent_runs: 100,
+                automation_max_concurrent_runs_per_flow: 10,
+                ..AppConfig::default()
+            },
+            Some(pool.clone()),
+        )
+        .expect("overlap state");
+        let (flow_id, version_id) = make_flow(&pool, &owner).await;
+        let trigger = insert_trigger(
+            &pool,
+            flow_id,
+            version_id,
+            Utc::now() + ChronoDuration::minutes(1),
+            "run_once",
+        )
+        .await;
+        let trigger = persistence::update_trigger(&pool, trigger.id, None, Some("skip"), None)
+            .await
+            .expect("skip policy");
+        let active = persistence::insert_run(
+            &pool,
+            flow_id,
+            version_id,
+            Some(trigger.id),
+            "schedule",
+            Some("n1"),
+            Some(&owner),
+            &json!({}),
+            None,
+            None,
+        )
+        .await
+        .expect("active run");
+        fire(&overlap_state, &trigger).await.expect("overlap skip");
+        assert_eq!(
+            persistence::latest_run(&pool, flow_id)
+                .await
+                .expect("latest run")
+                .expect("run")
+                .id,
+            active.id
+        );
+        assert_eq!(
+            persistence::count_runs(&pool, Some(flow_id), None, None)
+                .await
+                .expect("count"),
+            1
+        );
+
+        // `cancel_previous` cancels the active run and starts a new one.
+        let trigger =
+            persistence::update_trigger(&pool, trigger.id, None, Some("cancel_previous"), None)
+                .await
+                .expect("cancel policy");
+        fire(&overlap_state, &trigger)
+            .await
+            .expect("overlap cancel");
+        let cancelled = persistence::get_run(&pool, active.id)
+            .await
+            .expect("cancelled run");
+        assert!(cancelled.cancel_requested_at.is_some());
+        assert_eq!(
+            persistence::count_runs(&pool, Some(flow_id), None, None)
+                .await
+                .expect("count"),
+            2
+        );
+
+        // Triggers without a version or schedule fields are ignored.
+        let mut manual = manual_trigger(flow_id);
+        fire(&state, &manual).await.expect("no version");
+        manual.repeat_kind = None;
+        fire(&state, &manual).await.expect("no repeat kind");
+        let mut no_next = manual_trigger(flow_id);
+        no_next.next_occurrence_at = None;
+        fire(&state, &no_next).await.expect("no next occurrence");
+
+        let no_pool = AppState::new(AppConfig::default(), None).expect("no pool state");
+        assert!(fire(&no_pool, &manual).await.is_err());
+
+        // A due trigger fires through the tick entry point.
+        let (flow_id, version_id) = make_flow(&pool, &owner).await;
+        let trigger = insert_trigger(
+            &pool,
+            flow_id,
+            version_id,
+            Utc::now() - ChronoDuration::milliseconds(100),
+            "run_once",
+        )
+        .await;
+        tick(&state).await.expect("tick");
+        let fired = persistence::latest_run(&pool, flow_id)
+            .await
+            .expect("latest run")
+            .expect("fired run");
+        assert_eq!(fired.trigger_id, Some(trigger.id));
+
+        // The loop returns immediately when shutdown is already requested.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        run(state.clone(), shutdown_rx).await;
+
+        // The loop also returns when the shutdown signal flips while sleeping.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run(state, shutdown_rx));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("loop stopped")
+            .expect("loop task");
+    }
+}
