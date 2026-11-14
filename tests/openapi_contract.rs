@@ -24,6 +24,7 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/market-data/load"),
     ("post", "/api/market-data/load-range"),
     ("post", "/api/market-data/load-range/async"),
+    ("post", "/api/market-data/history-load"),
     ("get", "/api/data-load/domains"),
     ("get", "/api/data-load/sources"),
     ("get", "/api/data-load/identifier-search"),
@@ -347,6 +348,27 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 assert!(
                     responses[*status]["content"]["application/json"].is_object(),
                     "{method} {path} {status} must document a JSON error envelope"
+                );
+            }
+            continue;
+        }
+
+        if *path == "/api/market-data/history-load" {
+            let expected: BTreeSet<&str> = ["200", "400", "404", "500", "502", "503"]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            assert!(
+                responses["200"]["content"]["application/json"].is_object(),
+                "{method} {path} must document a JSON success body"
+            );
+            for status in ["400", "404", "500", "502", "503"] {
+                assert!(
+                    responses[status]["content"]["text/plain"].is_object(),
+                    "{method} {path} {status} must document a text/plain error body"
                 );
             }
             continue;

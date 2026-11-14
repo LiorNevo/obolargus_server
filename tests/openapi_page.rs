@@ -146,6 +146,7 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/history",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/retract",
             "/api/domain/{subject}/{subject_id}/facts/{fact_type}/series",
+            "/api/market-data/history-load",
             "/api/market-data/load",
             "/api/market-data/load-range",
             "/api/market-data/load-range/async",

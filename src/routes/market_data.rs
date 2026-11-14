@@ -18,10 +18,15 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use obolargus_core::domain::id::DomainId;
+use obolargus_core::domain::asset::read::get_asset;
+use obolargus_core::domain::error::DomainError;
+use obolargus_core::domain::id::{AssetId, DomainId};
 use obolargus_core::market_data::audit::LoadRunContext;
 use obolargus_core::market_data::data_domain::DataDomain;
 use obolargus_core::market_data::error::MarketDataProviderError;
+use obolargus_core::market_data::history_load::{
+    HistoryLoadConfig, HistoryLoadReport, run_asset_history_load,
+};
 use obolargus_core::market_data::load::{
     IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load_with_snapshot,
 };
@@ -798,6 +803,126 @@ pub async fn start_load_range(
             status: "accepted".to_string(),
         }),
     ))
+}
+
+/// Body of `POST /api/market-data/history-load`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct HistoryLoadBody {
+    /// Existing asset id.
+    pub asset_id: Uuid,
+    /// Inclusive first date (`YYYY-MM-DD`).
+    pub from: String,
+    /// Inclusive last date (`YYYY-MM-DD`), not later than today.
+    pub to: String,
+    /// Optional preferred source id.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// `POST /api/market-data/history-load` — load one bounded window for an asset.
+///
+/// The window is at most 366 calendar days. The operation resolves the asset's
+/// preferred identifier, walks the configured sources once, and stores every
+/// returned bar. Provider failures are report outcomes; only validation,
+/// unknown assets, a missing pool, or audit/storage errors produce non-200
+/// statuses.
+#[utoipa::path(
+    post,
+    path = "/api/market-data/history-load",
+    tag = "market-data",
+    summary = "Load a bounded history window for an asset",
+    description = "Loads stored end-of-day bars for one existing asset over a window of at most 366 days. Per-source and absence outcomes are reported in the 200 body.",
+    request_body = HistoryLoadBody,
+    responses(
+        (status = 200, description = "The history-load report", body = HistoryLoadReport),
+        (status = 400, description = "Invalid date, reversed/future/over-long range, or asset without identifiers", body = String, content_type = "text/plain"),
+        (status = 404, description = "Unknown asset", body = String, content_type = "text/plain"),
+        (status = 502, description = "Provider unavailable or rate-limited before a report could be produced", body = String, content_type = "text/plain"),
+        (status = 503, description = "No database pool configured", body = String, content_type = "text/plain"),
+        (status = 500, description = "Unexpected server, audit, or storage failure", body = String, content_type = "text/plain")
+    )
+)]
+pub async fn history_load(
+    State(state): State<AppState>,
+    Json(body): Json<HistoryLoadBody>,
+) -> Result<Json<HistoryLoadReport>, (StatusCode, String)> {
+    let from = chrono::NaiveDate::parse_from_str(body.from.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: '{}' is not a valid YYYY-MM-DD date",
+                body.from
+            ),
+        )
+    })?;
+    let to = chrono::NaiveDate::parse_from_str(body.to.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: '{}' is not a valid YYYY-MM-DD date",
+                body.to
+            ),
+        )
+    })?;
+    if from > to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: range start {from} is later than range end {to}"),
+        ));
+    }
+    let today = chrono::Utc::now().date_naive();
+    if to > today {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("validation error: as-of date {to} is later than today ({today})"),
+        ));
+    }
+    let days = (to - from).num_days() + 1;
+    if days > obolargus_core::market_data::history_load::MAX_HISTORY_WINDOW_DAYS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "validation error: the history range is {days} days; the maximum is {}",
+                obolargus_core::market_data::history_load::MAX_HISTORY_WINDOW_DAYS
+            ),
+        ));
+    }
+    let pool = state.pool.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no database pool configured".to_string(),
+        )
+    })?;
+    let asset_id = AssetId::from_uuid(body.asset_id);
+    get_asset(pool, asset_id)
+        .await
+        .map_err(|error| match error {
+            DomainError::NotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                format!("unknown asset '{}'", body.asset_id),
+            ),
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("asset lookup failed: {other}"),
+            ),
+        })?;
+    let report = run_asset_history_load(
+        pool,
+        &state.market_data,
+        HistoryLoadConfig {
+            asset_id,
+            from,
+            to,
+            preferred_source: body.source,
+            trigger: "chart".to_string(),
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "history load failed");
+        typed_error_to_http(&error)
+    })?;
+    Ok(Json(report))
 }
 
 /// Maps a typed provider error onto an HTTP status code and message.

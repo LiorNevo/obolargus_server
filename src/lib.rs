@@ -118,6 +118,7 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::assets::search_assets))
         .routes(routes!(routes::market_data::list_sources))
         .routes(routes!(routes::market_data::refresh))
+        .routes(routes!(routes::market_data::history_load))
         .routes(routes!(routes::market_data::lookup))
         .routes(routes!(routes::market_data::reconcile))
         .routes(routes!(routes::market_data::load))
