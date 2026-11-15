@@ -322,6 +322,10 @@ async fn http_range_load_groups_rows_and_reports_progress() {
         pool: Some(pool.clone()),
         market_data: registry,
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     };
     let group_id = Uuid::new_v4();
     let body = format!(
@@ -404,6 +408,10 @@ async fn http_async_range_load_returns_202_and_progress_completes() {
         pool: Some(pool.clone()),
         market_data: registry,
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     };
     let group_id = Uuid::new_v4();
     let body = format!(
@@ -485,6 +493,10 @@ async fn http_single_date_load_reports_stored_provenance() {
         pool: Some(pool),
         market_data: registry,
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     };
     let response = router(state)
         .oneshot(
@@ -525,6 +537,10 @@ fn state_with_pool(pool: sqlx::PgPool, source_id: &str) -> AppState {
         pool: Some(pool),
         market_data: registry,
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     }
 }
 

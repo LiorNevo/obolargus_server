@@ -7,4 +7,5 @@ pub mod domain;
 pub mod health;
 pub(crate) mod load_cancellation;
 pub mod market_data;
+pub mod morpheus;
 pub mod temporal;

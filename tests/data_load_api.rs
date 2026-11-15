@@ -70,6 +70,10 @@ fn state() -> AppState {
             DataSourceRegistry::new(vec![provider]).expect("registry"),
         ),
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     }
 }
 
@@ -377,6 +381,10 @@ fn search_state(pool: sqlx::PgPool, sources: Vec<ScriptedSearchSource>) -> AppSt
         pool: Some(pool),
         market_data: std::sync::Arc::new(DataSourceRegistry::new(providers).expect("registry")),
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     }
 }
 

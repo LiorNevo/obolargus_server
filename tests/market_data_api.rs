@@ -96,6 +96,10 @@ fn state_with(providers: Vec<LookupProvider>) -> AppState {
         pool: None,
         market_data: std::sync::Arc::new(registry),
         automation: std::sync::Arc::new(obolargus_server::automation::state::AutomationState::new()),
+        morpheus: std::sync::Arc::new(
+            obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
+                .expect("morpheus"),
+        ),
     }
 }
 

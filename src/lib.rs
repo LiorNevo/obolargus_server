@@ -12,6 +12,7 @@ pub mod automation;
 pub mod config;
 pub mod docs;
 pub mod market_data_provider;
+pub mod morpheus;
 pub mod routes;
 pub mod tasks;
 
@@ -37,6 +38,8 @@ pub struct AppState {
     pub market_data: Arc<obolargus_core::market_data::registry::DataSourceRegistry>,
     /// Automation node registry and per-run cancellation handles.
     pub automation: Arc<automation::state::AutomationState>,
+    /// Morpheus agent runtime state.
+    pub morpheus: Arc<morpheus::state::MorpheusState>,
 }
 
 impl AppState {
@@ -53,11 +56,16 @@ impl AppState {
         let automation = Arc::new(automation::state::AutomationState::with_capabilities(
             &config.automation_enabled_capabilities,
         ));
+        let morpheus = Arc::new(
+            morpheus::state::MorpheusState::new(&config)
+                .map_err(|error| format!("morpheus state: {error}"))?,
+        );
         Ok(Self {
             config,
             pool,
             market_data,
             automation,
+            morpheus,
         })
     }
 
@@ -78,11 +86,16 @@ impl AppState {
         let automation = Arc::new(automation::state::AutomationState::with_capabilities(
             &config.automation_enabled_capabilities,
         ));
+        let morpheus = Arc::new(
+            morpheus::state::MorpheusState::new(&config)
+                .map_err(|error| format!("morpheus state: {error}"))?,
+        );
         Ok(Self {
             config,
             pool,
             market_data,
             automation,
+            morpheus,
         })
     }
 }
@@ -173,6 +186,28 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
         .routes(routes!(routes::automation::triggers::invoke_trigger))
         .routes(routes!(routes::automation::audit::list_audit))
         .routes(routes!(routes::automation::events::stream_events))
+        .routes(routes!(
+            routes::morpheus::conversations::create_conversation
+        ))
+        .routes(routes!(routes::morpheus::conversations::list_conversations))
+        .routes(routes!(routes::morpheus::conversations::get_conversation))
+        .routes(routes!(routes::morpheus::conversations::list_messages))
+        .routes(routes!(
+            routes::morpheus::conversations::rename_conversation
+        ))
+        .routes(routes!(
+            routes::morpheus::conversations::delete_conversation
+        ))
+        .routes(routes!(routes::morpheus::messages::send_message))
+        .routes(routes!(routes::morpheus::turns::get_turn))
+        .routes(routes!(routes::morpheus::turns::stop_turn))
+        .routes(routes!(routes::morpheus::turns::retry_turn))
+        .routes(routes!(routes::morpheus::approvals::decide))
+        .routes(routes!(routes::morpheus::approvals::list_standing))
+        .routes(routes!(routes::morpheus::approvals::revoke_standing))
+        .routes(routes!(routes::morpheus::events::stream_events))
+        .routes(routes!(routes::morpheus::status::get_status))
+        .routes(routes!(routes::morpheus::catalog::list_tools))
 }
 
 /// Returns the OpenAPI 3.1 document generated from [`api_router`].
@@ -284,6 +319,11 @@ pub async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error + 
     let state = AppState::new_with_persistence(config.clone(), pool).await?;
 
     if let Some(pool) = state.pool.as_ref() {
+        if state.config.morpheus_enabled
+            && let Err(error) = morpheus::recovery::run(pool).await
+        {
+            tracing::warn!(%error, "could not recover Morpheus state");
+        }
         match obolargus_core::automation::runtime::persistence::mark_interrupted_runs(pool).await {
             Ok(0) => {}
             Ok(count) => tracing::warn!(count, "marked stale automation runs interrupted"),

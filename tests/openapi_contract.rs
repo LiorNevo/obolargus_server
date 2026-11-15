@@ -98,6 +98,28 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/automation/runs/{run_id}/retry"),
     ("post", "/api/automation/triggers/{trigger_id}/invoke"),
     ("put", "/api/automation/flows/{flow_id}/draft"),
+    ("post", "/api/morpheus/conversations"),
+    ("get", "/api/morpheus/conversations"),
+    ("get", "/api/morpheus/conversations/{conversation_id}"),
+    ("patch", "/api/morpheus/conversations/{conversation_id}"),
+    ("delete", "/api/morpheus/conversations/{conversation_id}"),
+    (
+        "get",
+        "/api/morpheus/conversations/{conversation_id}/messages",
+    ),
+    (
+        "post",
+        "/api/morpheus/conversations/{conversation_id}/messages",
+    ),
+    ("get", "/api/morpheus/turns/{turn_id}"),
+    ("get", "/api/morpheus/turns/{turn_id}/events"),
+    ("post", "/api/morpheus/turns/{turn_id}/stop"),
+    ("post", "/api/morpheus/turns/{turn_id}/retry"),
+    ("get", "/api/morpheus/status"),
+    ("get", "/api/morpheus/tools"),
+    ("post", "/api/morpheus/approvals/{approval_id}"),
+    ("get", "/api/morpheus/approvals/standing"),
+    ("delete", "/api/morpheus/approvals/standing/{approval_id}"),
 ];
 
 fn document() -> Value {
@@ -191,7 +213,8 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 || tag == "domain"
                 || tag == "data-dictionary"
                 || tag == "data-load"
-                || tag == "automation"),
+                || tag == "automation"
+                || tag == "morpheus"),
             "{method} {path} must carry a known tag"
         );
         assert!(
@@ -205,6 +228,76 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
             .as_object()
             .expect("operation responses");
         let statuses: BTreeSet<&str> = responses.keys().map(String::as_str).collect();
+
+        // Morpheus documents JSON responses; status sets are handler-specific.
+        if path.starts_with("/api/morpheus/") {
+            let expected: BTreeSet<&str> = match (*method, *path) {
+                ("post", "/api/morpheus/conversations") => {
+                    ["200", "201", "400"].into_iter().collect()
+                }
+                ("get", "/api/morpheus/conversations") => ["200", "503"].into_iter().collect(),
+                ("get", "/api/morpheus/conversations/{conversation_id}") => {
+                    ["200", "404"].into_iter().collect()
+                }
+                ("patch", "/api/morpheus/conversations/{conversation_id}") => {
+                    ["200", "400"].into_iter().collect()
+                }
+                ("delete", "/api/morpheus/conversations/{conversation_id}") => {
+                    ["204", "404"].into_iter().collect()
+                }
+                ("get", "/api/morpheus/conversations/{conversation_id}/messages") => {
+                    ["200", "404"].into_iter().collect()
+                }
+                ("post", "/api/morpheus/conversations/{conversation_id}/messages") => {
+                    ["202", "400", "409", "413"].into_iter().collect()
+                }
+                ("get", "/api/morpheus/turns/{turn_id}") => ["200", "404"].into_iter().collect(),
+                ("get", "/api/morpheus/turns/{turn_id}/events") => {
+                    ["200", "404"].into_iter().collect()
+                }
+                ("post", "/api/morpheus/turns/{turn_id}/stop") => {
+                    ["200", "404"].into_iter().collect()
+                }
+                ("post", "/api/morpheus/turns/{turn_id}/retry") => {
+                    ["202", "409"].into_iter().collect()
+                }
+                ("post", "/api/morpheus/approvals/{approval_id}") => {
+                    ["200", "400", "409"].into_iter().collect()
+                }
+                ("get", "/api/morpheus/approvals/standing") => ["200", "503"].into_iter().collect(),
+                ("delete", "/api/morpheus/approvals/standing/{approval_id}") => {
+                    ["204", "404"].into_iter().collect()
+                }
+                _ => ["200", "503"].into_iter().collect(),
+            };
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            let bodyless = *method == "delete" || path.ends_with("/events");
+            if !bodyless {
+                let success = if statuses.contains("201") {
+                    "201"
+                } else if statuses.contains("202") {
+                    "202"
+                } else {
+                    "200"
+                };
+                assert!(
+                    responses[success]["content"]["application/json"].is_object(),
+                    "{method} {path} must document a JSON success body"
+                );
+            }
+            for status in expected.iter().filter(|status| {
+                **status != "200" && **status != "201" && **status != "202" && **status != "204"
+            }) {
+                assert!(
+                    responses[*status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON error envelope"
+                );
+            }
+            continue;
+        }
 
         // Asset search is an additive JSON read with its own status set.
         if *path == "/api/assets" {

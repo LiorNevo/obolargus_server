@@ -13,7 +13,7 @@ use std::fmt;
 use obolargus_core::market_data::config::{DataSourceConfig, MarketDataConfig};
 
 /// Application configuration for the API server.
-#[derive(Debug, Clone, PartialEq, Eq, Envconfig)]
+#[derive(Debug, Clone, PartialEq, Envconfig)]
 pub struct AppConfig {
     /// Bind address.
     #[envconfig(from = "APP_HOST", default = "127.0.0.1")]
@@ -175,6 +175,152 @@ pub struct AppConfig {
     /// API trigger rate limit per minute.
     #[envconfig(from = "AUTOMATION_API_TRIGGER_RATE_LIMIT_PER_MINUTE", default = "60")]
     pub automation_api_trigger_rate_limit_per_minute: u32,
+
+    // ---- Morpheus agent chat (spec 032) ----
+    /// Enables Morpheus routes, engine, and UI entry point.
+    #[envconfig(from = "MORPHEUS_ENABLED", default = "false")]
+    pub morpheus_enabled: bool,
+    /// OmniRoute OpenAI-compatible base URL.
+    #[envconfig(from = "OMNIROUTE_BASE_URL", default = "http://omniroute:20128/v1")]
+    pub omniroute_base_url: String,
+    /// OmniRoute bearer credential. Lives beside DATABASE_URL in `.env`.
+    #[envconfig(from = "OMNIROUTE_API_KEY", default = "")]
+    pub omniroute_api_key: String,
+    /// Provider display label.
+    #[envconfig(from = "MORPHEUS_PROVIDER_LABEL", default = "OmniRoute")]
+    pub morpheus_provider_label: String,
+    /// Text/tool routing alias.
+    #[envconfig(from = "MORPHEUS_MODEL", default = "auto")]
+    pub morpheus_model: String,
+    /// Vision routing alias; empty means `MORPHEUS_MODEL`.
+    #[envconfig(from = "MORPHEUS_VISION_MODEL", default = "")]
+    pub morpheus_vision_model: String,
+    /// Additional system prompt text appended after the fixed preamble.
+    #[envconfig(from = "MORPHEUS_SYSTEM_PROMPT", default = "")]
+    pub morpheus_system_prompt: String,
+    /// Acting user identifier until authentication is enabled.
+    #[envconfig(from = "MORPHEUS_ACTOR_ID", default = "dev-user")]
+    pub morpheus_actor_id: String,
+    /// Comma-separated tool ids or `all`.
+    #[envconfig(from = "MORPHEUS_TOOL_CATALOG", default = "all")]
+    pub morpheus_tool_catalog: String,
+    /// Allows "approve all and remember".
+    #[envconfig(from = "MORPHEUS_STANDING_APPROVALS_ENABLED", default = "true")]
+    pub morpheus_standing_approvals_enabled: bool,
+    /// Sampling temperature.
+    #[envconfig(from = "MORPHEUS_TEMPERATURE", default = "0.2")]
+    pub morpheus_temperature: f64,
+    /// Answer token cap.
+    #[envconfig(from = "MORPHEUS_MAX_TOKENS", default = "2048")]
+    pub morpheus_max_tokens: u32,
+    /// Maximum user message characters.
+    #[envconfig(from = "MORPHEUS_MAX_MESSAGE_CHARS", default = "8000")]
+    pub morpheus_max_message_chars: usize,
+    /// Maximum user message bytes.
+    #[envconfig(from = "MORPHEUS_MAX_MESSAGE_BYTES", default = "32768")]
+    pub morpheus_max_message_bytes: usize,
+    /// Maximum prior turns in the prompt.
+    #[envconfig(from = "MORPHEUS_MAX_CONTEXT_MESSAGES", default = "20")]
+    pub morpheus_max_context_messages: usize,
+    /// Prompt character budget.
+    #[envconfig(from = "MORPHEUS_MAX_CONTEXT_CHARS", default = "48000")]
+    pub morpheus_max_context_chars: usize,
+    /// Maximum stored answer bytes.
+    #[envconfig(from = "MORPHEUS_MAX_ANSWER_BYTES", default = "262144")]
+    pub morpheus_max_answer_bytes: usize,
+    /// Maximum ReACT steps per turn.
+    #[envconfig(from = "MORPHEUS_MAX_REACT_STEPS", default = "12")]
+    pub morpheus_max_react_steps: u32,
+    /// Maximum provider calls per turn.
+    #[envconfig(from = "MORPHEUS_MAX_PROVIDER_CALLS", default = "12")]
+    pub morpheus_max_provider_calls: u32,
+    /// Maximum tool calls per turn.
+    #[envconfig(from = "MORPHEUS_MAX_TOOL_CALLS_PER_TURN", default = "16")]
+    pub morpheus_max_tool_calls_per_turn: u32,
+    /// Maximum UI actions per turn.
+    #[envconfig(from = "MORPHEUS_MAX_UI_ACTIONS_PER_TURN", default = "20")]
+    pub morpheus_max_ui_actions_per_turn: u32,
+    /// Maximum screen observations per turn.
+    #[envconfig(from = "MORPHEUS_MAX_OBSERVATIONS_PER_TURN", default = "12")]
+    pub morpheus_max_observations_per_turn: u32,
+    /// Active-work wall clock per turn.
+    #[envconfig(from = "MORPHEUS_TURN_MAX_SECONDS", default = "300")]
+    pub morpheus_turn_max_seconds: u64,
+    /// One tool call timeout.
+    #[envconfig(from = "MORPHEUS_TOOL_TIMEOUT_SECONDS", default = "30")]
+    pub morpheus_tool_timeout_seconds: u64,
+    /// Tool result cap sent to the model.
+    #[envconfig(from = "MORPHEUS_TOOL_MAX_RESULT_BYTES", default = "32768")]
+    pub morpheus_tool_max_result_bytes: usize,
+    /// One UI action result timeout.
+    #[envconfig(from = "MORPHEUS_UI_ACTION_TIMEOUT_SECONDS", default = "15")]
+    pub morpheus_ui_action_timeout_seconds: u64,
+    /// Approval decision window.
+    #[envconfig(from = "MORPHEUS_APPROVAL_TIMEOUT_SECONDS", default = "300")]
+    pub morpheus_approval_timeout_seconds: u64,
+    /// Maximum pending approvals per turn.
+    #[envconfig(from = "MORPHEUS_MAX_PENDING_APPROVALS", default = "10")]
+    pub morpheus_max_pending_approvals: u32,
+    /// Maximum queued messages per conversation.
+    #[envconfig(from = "MORPHEUS_QUEUE_MAX_PER_CONVERSATION", default = "5")]
+    pub morpheus_queue_max_per_conversation: u32,
+    /// Global concurrent turns.
+    #[envconfig(from = "MORPHEUS_MAX_CONCURRENT_TURNS", default = "4")]
+    pub morpheus_max_concurrent_turns: u32,
+    /// Sends per actor per minute.
+    #[envconfig(from = "MORPHEUS_SEND_RATE_LIMIT_PER_MINUTE", default = "30")]
+    pub morpheus_send_rate_limit_per_minute: u32,
+    /// Maximum concurrent SSE viewers.
+    #[envconfig(from = "MORPHEUS_MAX_SSE_STREAMS", default = "20")]
+    pub morpheus_max_sse_streams: u32,
+    /// SSE projection poll cadence.
+    #[envconfig(from = "MORPHEUS_SSE_POLL_MS", default = "250")]
+    pub morpheus_sse_poll_ms: u64,
+    /// Maximum SSE stream lifetime.
+    #[envconfig(from = "MORPHEUS_SSE_MAX_DURATION_SECONDS", default = "1800")]
+    pub morpheus_sse_max_duration_seconds: u64,
+    /// Provider connect timeout.
+    #[envconfig(from = "MORPHEUS_CONNECT_TIMEOUT_SECONDS", default = "5")]
+    pub morpheus_connect_timeout_seconds: u64,
+    /// Maximum gap between provider chunks.
+    #[envconfig(from = "MORPHEUS_IDLE_TIMEOUT_SECONDS", default = "30")]
+    pub morpheus_idle_timeout_seconds: u64,
+    /// Answer persistence cadence.
+    #[envconfig(from = "MORPHEUS_STREAM_FLUSH_MS", default = "250")]
+    pub morpheus_stream_flush_ms: u64,
+    /// Provider status cache TTL.
+    #[envconfig(from = "MORPHEUS_STATUS_PROBE_SECONDS", default = "30")]
+    pub morpheus_status_probe_seconds: u64,
+    /// Enables screen capture/control.
+    #[envconfig(from = "MORPHEUS_VISION_ENABLED", default = "true")]
+    pub morpheus_vision_enabled: bool,
+    /// Image long edge.
+    #[envconfig(from = "MORPHEUS_VISION_MAX_DIMENSION", default = "1280")]
+    pub morpheus_vision_max_dimension: i32,
+    /// JPEG quality.
+    #[envconfig(from = "MORPHEUS_VISION_JPEG_QUALITY", default = "70")]
+    pub morpheus_vision_jpeg_quality: u8,
+    /// Upload byte cap.
+    #[envconfig(from = "MORPHEUS_VISION_MAX_BYTES", default = "524288")]
+    pub morpheus_vision_max_bytes: i32,
+    /// Element-map cap.
+    #[envconfig(from = "MORPHEUS_VISION_MAX_ELEMENTS", default = "200")]
+    pub morpheus_vision_max_elements: usize,
+    /// Mask-manifest cap.
+    #[envconfig(from = "MORPHEUS_VISION_MAX_MASK_REGIONS", default = "200")]
+    pub morpheus_vision_max_mask_regions: usize,
+    /// Capture result timeout.
+    #[envconfig(from = "MORPHEUS_VISION_CAPTURE_TIMEOUT_SECONDS", default = "20")]
+    pub morpheus_vision_capture_timeout_seconds: u64,
+    /// Observation image sweep age.
+    #[envconfig(from = "MORPHEUS_OBSERVATION_TTL_SECONDS", default = "600")]
+    pub morpheus_observation_ttl_seconds: u64,
+    /// Control lease TTL.
+    #[envconfig(from = "MORPHEUS_CONTROL_LEASE_SECONDS", default = "30")]
+    pub morpheus_control_lease_seconds: u64,
+    /// Test-only vision injector.
+    #[envconfig(from = "MORPHEUS_VISION_TEST_MODE", default = "false")]
+    pub morpheus_vision_test_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -232,6 +378,54 @@ impl Default for AppConfig {
             automation_idle_timeout_ms: 2_000,
             automation_debug_buffer_size: 1_000,
             automation_api_trigger_rate_limit_per_minute: 60,
+            morpheus_enabled: false,
+            omniroute_base_url: "http://omniroute:20128/v1".to_string(),
+            omniroute_api_key: String::new(),
+            morpheus_provider_label: "OmniRoute".to_string(),
+            morpheus_model: "auto".to_string(),
+            morpheus_vision_model: String::new(),
+            morpheus_system_prompt: String::new(),
+            morpheus_actor_id: "dev-user".to_string(),
+            morpheus_tool_catalog: "all".to_string(),
+            morpheus_standing_approvals_enabled: true,
+            morpheus_temperature: 0.2,
+            morpheus_max_tokens: 2048,
+            morpheus_max_message_chars: 8_000,
+            morpheus_max_message_bytes: 32_768,
+            morpheus_max_context_messages: 20,
+            morpheus_max_context_chars: 48_000,
+            morpheus_max_answer_bytes: 262_144,
+            morpheus_max_react_steps: 12,
+            morpheus_max_provider_calls: 12,
+            morpheus_max_tool_calls_per_turn: 16,
+            morpheus_max_ui_actions_per_turn: 20,
+            morpheus_max_observations_per_turn: 12,
+            morpheus_turn_max_seconds: 300,
+            morpheus_tool_timeout_seconds: 30,
+            morpheus_tool_max_result_bytes: 32_768,
+            morpheus_ui_action_timeout_seconds: 15,
+            morpheus_approval_timeout_seconds: 300,
+            morpheus_max_pending_approvals: 10,
+            morpheus_queue_max_per_conversation: 5,
+            morpheus_max_concurrent_turns: 4,
+            morpheus_send_rate_limit_per_minute: 30,
+            morpheus_max_sse_streams: 20,
+            morpheus_sse_poll_ms: 250,
+            morpheus_sse_max_duration_seconds: 1_800,
+            morpheus_connect_timeout_seconds: 5,
+            morpheus_idle_timeout_seconds: 30,
+            morpheus_stream_flush_ms: 250,
+            morpheus_status_probe_seconds: 30,
+            morpheus_vision_enabled: true,
+            morpheus_vision_max_dimension: 1280,
+            morpheus_vision_jpeg_quality: 70,
+            morpheus_vision_max_bytes: 524_288,
+            morpheus_vision_max_elements: 200,
+            morpheus_vision_max_mask_regions: 200,
+            morpheus_vision_capture_timeout_seconds: 20,
+            morpheus_observation_ttl_seconds: 600,
+            morpheus_control_lease_seconds: 30,
+            morpheus_vision_test_mode: false,
         }
     }
 }
@@ -315,6 +509,119 @@ impl AppConfig {
             ));
         }
         self.validate_automation()?;
+        self.validate_morpheus()?;
+        Ok(())
+    }
+
+    /// Fail-fast validation for the spec-032 Morpheus keys.
+    fn validate_morpheus(&self) -> Result<(), ConfigError> {
+        if self.morpheus_enabled && self.omniroute_api_key.trim().is_empty() {
+            return Err(ConfigError::Load(
+                "OMNIROUTE_API_KEY must be set when MORPHEUS_ENABLED=true".to_string(),
+            ));
+        }
+        let url = reqwest::Url::parse(self.omniroute_base_url.trim()).map_err(|error| {
+            ConfigError::Load(format!("OMNIROUTE_BASE_URL is not a valid URL: {error}"))
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ConfigError::Load(
+                "OMNIROUTE_BASE_URL must use http or https".to_string(),
+            ));
+        }
+        for (name, value) in [
+            ("MORPHEUS_PROVIDER_LABEL", &self.morpheus_provider_label),
+            ("MORPHEUS_MODEL", &self.morpheus_model),
+            ("MORPHEUS_ACTOR_ID", &self.morpheus_actor_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::Load(format!("{name} must be non-empty")));
+            }
+        }
+        if !(0.0..=2.0).contains(&self.morpheus_temperature) {
+            return Err(ConfigError::Load(
+                "MORPHEUS_TEMPERATURE must be in 0.0..=2.0".to_string(),
+            ));
+        }
+        if self.morpheus_tool_catalog.trim() != "all" {
+            let ids: Vec<String> = self
+                .morpheus_tool_catalog
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect();
+            obolargus_core::morpheus::tools::ToolCatalog::new(&ids)
+                .map_err(|error| ConfigError::Load(format!("MORPHEUS_TOOL_CATALOG: {error}")))?;
+        }
+        for (name, value, min, max) in [
+            (
+                "MORPHEUS_MAX_MESSAGE_CHARS",
+                self.morpheus_max_message_chars as u64,
+                1,
+                100_000,
+            ),
+            (
+                "MORPHEUS_MAX_MESSAGE_BYTES",
+                self.morpheus_max_message_bytes as u64,
+                1,
+                1_048_576,
+            ),
+            (
+                "MORPHEUS_MAX_CONTEXT_MESSAGES",
+                self.morpheus_max_context_messages as u64,
+                1,
+                100,
+            ),
+            (
+                "MORPHEUS_MAX_CONTEXT_CHARS",
+                self.morpheus_max_context_chars as u64,
+                1_000,
+                400_000,
+            ),
+            (
+                "MORPHEUS_MAX_REACT_STEPS",
+                u64::from(self.morpheus_max_react_steps),
+                1,
+                50,
+            ),
+            (
+                "MORPHEUS_MAX_PROVIDER_CALLS",
+                u64::from(self.morpheus_max_provider_calls),
+                1,
+                50,
+            ),
+            (
+                "MORPHEUS_QUEUE_MAX_PER_CONVERSATION",
+                u64::from(self.morpheus_queue_max_per_conversation),
+                1,
+                50,
+            ),
+            (
+                "MORPHEUS_MAX_CONCURRENT_TURNS",
+                u64::from(self.morpheus_max_concurrent_turns),
+                1,
+                64,
+            ),
+            (
+                "MORPHEUS_APPROVAL_TIMEOUT_SECONDS",
+                self.morpheus_approval_timeout_seconds,
+                30,
+                3_600,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(ConfigError::Load(format!(
+                    "{name} must be in {min}..={max} (got {value})"
+                )));
+            }
+        }
+        if self.morpheus_tool_timeout_seconds > self.morpheus_turn_max_seconds
+            || self.morpheus_ui_action_timeout_seconds > self.morpheus_turn_max_seconds
+        {
+            return Err(ConfigError::Load(
+                "tool/UI timeout must not exceed MORPHEUS_TURN_MAX_SECONDS".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -679,5 +986,37 @@ mod tests {
         let config = AppConfig::init_from_hashmap(&env).unwrap();
         assert_eq!(config.temporal_ingest_concurrency, 8);
         assert_eq!(config.temporal_price_source_policy, "named");
+    }
+
+    #[test]
+    fn morpheus_requires_key_when_enabled() {
+        let config = AppConfig {
+            morpheus_enabled: true,
+            omniroute_api_key: String::new(),
+            ..AppConfig::default()
+        };
+        let error = config.validate().expect_err("missing key must fail");
+        assert!(format!("{error}").contains("OMNIROUTE_API_KEY"));
+    }
+
+    #[test]
+    fn morpheus_accepts_a_valid_provider_configuration() {
+        let config = AppConfig {
+            morpheus_enabled: true,
+            omniroute_api_key: "test-key".to_string(),
+            omniroute_base_url: "http://omniroute:20128/v1".to_string(),
+            morpheus_model: "auto".to_string(),
+            ..AppConfig::default()
+        };
+        config.validate().expect("valid Morpheus config");
+    }
+
+    #[test]
+    fn morpheus_rejects_unknown_catalog_ids() {
+        let config = AppConfig {
+            morpheus_tool_catalog: "assets.search,nope".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }
