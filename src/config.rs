@@ -1019,4 +1019,116 @@ mod tests {
         };
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn cors_origins_trim_and_drop_empty_entries() {
+        let config = AppConfig {
+            cors_allowed_origins: " , http://a ,, http://b , ".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(config.cors_origins(), vec!["http://a", "http://b"]);
+    }
+
+    #[test]
+    fn blank_database_url_is_absent() {
+        let config = AppConfig {
+            database_url: "   ".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(config.database_url(), None);
+    }
+
+    #[test]
+    fn custom_market_data_sources_are_parsed() {
+        let config = AppConfig {
+            market_data_sources: r#"[{"source_id":"custom","display_name":"Custom","provider_type":"yahoo_finance","enabled":true,"priority":1,"supported_schemes":["TICKER"]}]"#.to_string(),
+            ..AppConfig::default()
+        };
+        let market_data = config.market_data_config().expect("custom source parses");
+        assert_eq!(market_data.sources.len(), 1);
+        assert_eq!(market_data.sources[0].source_id, "custom");
+    }
+
+    #[test]
+    fn automation_validation_covers_actor_and_zero_bounds() {
+        let base = AppConfig::default();
+        base.validate().expect("defaults are valid");
+
+        let mut empty_actor = base.clone();
+        empty_actor.automation_actor_id = "  ".to_string();
+        assert!(empty_actor.validate().is_err());
+
+        let mut zero_runs = base.clone();
+        zero_runs.automation_max_concurrent_runs = 0;
+        assert!(zero_runs.validate().is_err());
+
+        let mut zero_interval = base.clone();
+        zero_interval.automation_scheduler_interval_seconds = 0;
+        assert!(zero_interval.validate().is_err());
+
+        let mut zero_bytes = base.clone();
+        zero_bytes.automation_max_flow_bytes = 0;
+        assert!(zero_bytes.validate().is_err());
+
+        let mut zero_depth = base;
+        zero_depth.automation_max_subflow_depth = 0;
+        assert!(zero_depth.validate().is_err());
+    }
+
+    #[test]
+    fn morpheus_validation_covers_url_labels_temperature_and_bounds() {
+        let base = AppConfig {
+            morpheus_enabled: true,
+            omniroute_api_key: "test-key".to_string(),
+            ..AppConfig::default()
+        };
+        base.validate().expect("valid Morpheus defaults");
+
+        let mut bad_url = base.clone();
+        bad_url.omniroute_base_url = "not a url".to_string();
+        assert!(bad_url.validate().is_err());
+
+        let mut bad_scheme = base.clone();
+        bad_scheme.omniroute_base_url = "ftp://omniroute/v1".to_string();
+        assert!(bad_scheme.validate().is_err());
+
+        let mut empty_label = base.clone();
+        empty_label.morpheus_provider_label = " ".to_string();
+        assert!(empty_label.validate().is_err());
+
+        let mut empty_model = base.clone();
+        empty_model.morpheus_model = String::new();
+        assert!(empty_model.validate().is_err());
+
+        let mut empty_actor = base.clone();
+        empty_actor.morpheus_actor_id = String::new();
+        assert!(empty_actor.validate().is_err());
+
+        let mut hot = base.clone();
+        hot.morpheus_temperature = 2.1;
+        assert!(hot.validate().is_err());
+
+        let mut too_many_chars = base.clone();
+        too_many_chars.morpheus_max_message_chars = 100_001;
+        assert!(too_many_chars.validate().is_err());
+
+        let mut too_many_steps = base.clone();
+        too_many_steps.morpheus_max_react_steps = 51;
+        assert!(too_many_steps.validate().is_err());
+
+        let mut timeout_overflow = base;
+        timeout_overflow.morpheus_tool_timeout_seconds = 301;
+        assert!(timeout_overflow.validate().is_err());
+    }
+
+    #[test]
+    fn config_error_display_covers_both_variants() {
+        let load = super::ConfigError::Load("detail".to_string());
+        assert_eq!(load.to_string(), "failed to load configuration: detail");
+        let missing = super::ConfigError::MissingJwtSecret;
+        assert_eq!(
+            missing.to_string(),
+            "AUTH_ENABLED is true but JWT_SECRET is not set"
+        );
+    }
 }

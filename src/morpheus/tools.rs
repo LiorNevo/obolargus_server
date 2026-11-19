@@ -205,3 +205,73 @@ async fn market_lookup(state: &AppState, arguments: &Value) -> Result<ToolOutcom
         truncated: false,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn string_arguments_trim_and_reject_empty_values() {
+        let arguments = json!({ "query": "  Apple  ", "empty": "   " });
+        assert_eq!(
+            string_argument(&arguments, "query"),
+            Some("Apple".to_string())
+        );
+        assert_eq!(string_argument(&arguments, "empty"), None);
+        assert_eq!(string_argument(&arguments, "missing"), None);
+    }
+
+    #[test]
+    fn date_arguments_parse_and_reject_invalid_values() {
+        let arguments = json!({ "from": "2024-01-02", "bad": "2024-13-40" });
+        assert_eq!(
+            date_argument(&arguments, "from").expect("date"),
+            Some(chrono::NaiveDate::from_ymd_opt(2024, 1, 2).expect("date"))
+        );
+        assert!(date_argument(&arguments, "bad").is_err());
+        assert_eq!(date_argument(&arguments, "missing").expect("missing"), None);
+    }
+
+    #[tokio::test]
+    async fn market_lookup_returns_a_latest_bar() {
+        use crate::market_data_provider::mock::{MockMarketDataProvider, make_bar};
+        use chrono::NaiveDate;
+        use obolargus_core::market_data::registry::DataSourceRegistry;
+        use std::sync::Arc;
+
+        let provider = MockMarketDataProvider::new("mock", &["TICKER"], 1).with_latest(
+            "TICKER",
+            "AAPL",
+            Ok(make_bar(
+                "mock",
+                NaiveDate::from_ymd_opt(2024, 1, 2).expect("date"),
+                100,
+            )),
+        );
+        let mut state =
+            crate::AppState::new(crate::config::AppConfig::default(), None).expect("state builds");
+        state.market_data =
+            Arc::new(DataSourceRegistry::new(vec![Arc::new(provider)]).expect("registry"));
+
+        let outcome = market_lookup(&state, &json!({ "identifier": "AAPL" }))
+            .await
+            .expect("lookup");
+        assert!(outcome.summary.contains("AAPL"));
+        assert_eq!(outcome.data["close"], "100");
+    }
+
+    #[tokio::test]
+    async fn unknown_tools_fail_clearly() {
+        let state =
+            crate::AppState::new(crate::config::AppConfig::default(), None).expect("state builds");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@127.0.0.1:1/db")
+            .expect("lazy pool");
+        let error = execute(&state, &pool, "unknown.tool", &json!({}))
+            .await
+            .expect_err("unknown tool fails");
+        assert_eq!(error.code(), ErrorCode::ToolFailed);
+        assert!(format!("{error}").contains("not implemented"));
+    }
+}

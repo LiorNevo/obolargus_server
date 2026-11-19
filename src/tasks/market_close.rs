@@ -36,3 +36,18 @@ pub async fn run(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn without_a_pool_the_refresh_is_a_no_op() {
+        let state =
+            crate::AppState::new(crate::config::AppConfig::default(), None).expect("state builds");
+        let summary = run(&state).await.expect("no-op refresh");
+        assert_eq!(summary.assets_attempted, 0);
+        assert_eq!(summary.assets_refreshed, 0);
+        assert_eq!(summary.run_id, uuid::Uuid::nil());
+    }
+}

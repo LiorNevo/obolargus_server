@@ -137,3 +137,32 @@ pub async fn get_status(State(state): State<AppState>) -> ApiResult<StatusRespon
 pub fn enabled_or_error(state: &AppState) -> Result<(), ApiError> {
     require_enabled(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabled_or_error_checks_the_feature_flag() {
+        let enabled = crate::AppState::new(
+            crate::config::AppConfig {
+                morpheus_enabled: true,
+                omniroute_api_key: "test-key".to_string(),
+                ..crate::config::AppConfig::default()
+            },
+            None,
+        )
+        .expect("state builds");
+        assert!(enabled_or_error(&enabled).is_ok());
+
+        let disabled = crate::AppState::new(
+            crate::config::AppConfig {
+                morpheus_enabled: false,
+                ..crate::config::AppConfig::default()
+            },
+            None,
+        )
+        .expect("state builds");
+        assert!(enabled_or_error(&disabled).is_err());
+    }
+}

@@ -147,3 +147,50 @@ pub fn tools_payload(catalog: &obolargus_core::morpheus::tools::ToolCatalog) -> 
         .collect();
     Value::Array(items)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obolargus_core::morpheus::tools::ToolCatalog;
+
+    #[test]
+    fn status_mapping_covers_provider_failures() {
+        let cases = [
+            (StatusCode::UNAUTHORIZED, ErrorCode::ProviderAuth),
+            (StatusCode::FORBIDDEN, ErrorCode::ProviderAuth),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::ProviderRateLimited,
+            ),
+            (StatusCode::REQUEST_TIMEOUT, ErrorCode::ProviderTimeout),
+            (StatusCode::GATEWAY_TIMEOUT, ErrorCode::ProviderTimeout),
+            (StatusCode::BAD_REQUEST, ErrorCode::ProviderCapability),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::ProviderCapability,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::ProviderUnavailable,
+            ),
+            (StatusCode::NOT_FOUND, ErrorCode::ProviderBadResponse),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(map_status(status, "detail").code(), expected);
+        }
+    }
+
+    #[test]
+    fn tools_payload_uses_openai_function_names() {
+        let catalog = ToolCatalog::new(&[]).expect("catalog");
+        let payload = tools_payload(&catalog);
+        let items = payload.as_array().expect("array");
+        assert!(!items.is_empty());
+        for item in items {
+            assert_eq!(item["type"], "function");
+            let name = item["function"]["name"].as_str().expect("name");
+            assert!(!name.contains('.'));
+            assert!(item["function"]["parameters"].is_object());
+        }
+    }
+}

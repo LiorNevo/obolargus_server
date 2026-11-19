@@ -499,3 +499,53 @@ impl From<ApprovalRecord> for ApprovalView {
 pub fn error_json(code: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message } })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_errors_map_every_morpheus_code() {
+        let cases = [
+            (ErrorCode::Validation, StatusCode::BAD_REQUEST),
+            (ErrorCode::NotFound, StatusCode::NOT_FOUND),
+            (ErrorCode::Conflict, StatusCode::CONFLICT),
+            (ErrorCode::Limit, StatusCode::CONFLICT),
+            (ErrorCode::QueueFull, StatusCode::CONFLICT),
+            (
+                ErrorCode::ProviderRateLimited,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                ErrorCode::ProviderUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (ErrorCode::ProviderAuth, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                ErrorCode::ProviderCapability,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (ErrorCode::ProviderTimeout, StatusCode::GATEWAY_TIMEOUT),
+            (ErrorCode::ApprovalExpired, StatusCode::CONFLICT),
+            (ErrorCode::ApprovalDenied, StatusCode::CONFLICT),
+            (ErrorCode::Infrastructure, StatusCode::INTERNAL_SERVER_ERROR),
+            (ErrorCode::ToolFailed, StatusCode::BAD_REQUEST),
+        ];
+        for (code, status) in cases {
+            let error = ApiError::from(MorpheusError::provider(code, "detail"));
+            assert_eq!(error.status, status, "{}", code.as_str());
+            assert_eq!(error.code, code.as_str());
+        }
+    }
+
+    #[test]
+    fn disabled_and_no_pool_errors_have_stable_wire_codes() {
+        let disabled = ApiError::disabled();
+        assert_eq!(disabled.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(disabled.code, "morpheus_disabled");
+
+        let no_pool = ApiError::no_pool();
+        assert_eq!(no_pool.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(no_pool.code, "internal_error");
+    }
+}

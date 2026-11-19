@@ -123,3 +123,53 @@ fn build_catalog(value: &str) -> Result<ToolCatalog, MorpheusError> {
         .collect();
     ToolCatalog::new(&ids)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_builds_all_empty_and_selected() {
+        assert_eq!(build_catalog("all").expect("all").specs().len(), 6);
+        assert_eq!(build_catalog("  ").expect("empty").specs().len(), 6);
+        assert_eq!(
+            build_catalog("assets.search,market_data.lookup")
+                .expect("selected")
+                .specs()
+                .len(),
+            2
+        );
+        assert!(build_catalog("nope").is_err());
+    }
+
+    #[test]
+    fn cancellation_registry_registers_cancels_and_removes() {
+        let state = MorpheusState::new(&crate::config::AppConfig::default()).expect("state");
+        let turn = Uuid::new_v4();
+        let token = state.register_cancellation(turn);
+        assert!(!token.is_cancelled());
+        state.cancel(turn);
+        assert!(token.is_cancelled());
+        state.remove_cancellation(turn);
+        state.cancel(turn);
+    }
+
+    #[test]
+    fn stream_slots_are_bounded_and_released() {
+        let state = MorpheusState::new(&crate::config::AppConfig::default()).expect("state");
+        assert!(state.acquire_stream(1));
+        assert!(!state.acquire_stream(1));
+        state.release_stream();
+        assert!(state.acquire_stream(1));
+        state.release_stream();
+    }
+
+    #[test]
+    fn health_snapshots_are_recorded() {
+        let state = MorpheusState::new(&crate::config::AppConfig::default()).expect("state");
+        state.set_health(true, None);
+        let health = state.health.lock().expect("health");
+        assert!(health.as_ref().expect("snapshot").available);
+        assert!(health.as_ref().expect("snapshot").last_error.is_none());
+    }
+}

@@ -673,3 +673,46 @@ async fn finish_limit(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulate_tool_merges_stream_fragments() {
+        let mut tools = Vec::new();
+        accumulate_tool(
+            &mut tools,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call-1".to_string()),
+                name: Some("assets__search".to_string()),
+                arguments: Some("{\"query\":".to_string()),
+            },
+        );
+        accumulate_tool(
+            &mut tools,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments: Some("\"Apple\"}".to_string()),
+            },
+        );
+        accumulate_tool(
+            &mut tools,
+            ToolCallDelta {
+                index: 2,
+                id: Some("call-2".to_string()),
+                name: Some("market_data__lookup".to_string()),
+                arguments: None,
+            },
+        );
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0].provider_id, "call-1");
+        assert_eq!(tools[0].name, "assets__search");
+        assert_eq!(tools[0].arguments, "{\"query\":\"Apple\"}");
+        assert_eq!(tools[1].name, "");
+        assert_eq!(tools[2].provider_id, "call-2");
+    }
+}

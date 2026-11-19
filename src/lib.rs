@@ -362,3 +362,121 @@ pub async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error + 
     server.await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn app_state_new_builds_without_a_pool() {
+        let state = AppState::new(AppConfig::default(), None).expect("state builds");
+        assert!(state.pool.is_none());
+        assert!(state.config.database_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn app_state_new_rejects_invalid_market_data_sources() {
+        let config = AppConfig {
+            market_data_sources: "not json".to_string(),
+            ..AppConfig::default()
+        };
+        let error = match AppState::new(config, None) {
+            Ok(_) => panic!("invalid sources must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("market data config"));
+    }
+
+    #[tokio::test]
+    async fn app_state_new_with_persistence_builds_without_a_pool() {
+        let state = AppState::new_with_persistence(AppConfig::default(), None)
+            .await
+            .expect("state builds");
+        assert!(state.pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn router_serves_health() {
+        let state = AppState::new(AppConfig::default(), None).expect("state builds");
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("status"));
+    }
+
+    #[test]
+    fn cors_origins_skip_invalid_header_values() {
+        let config = AppConfig {
+            cors_allowed_origins: "http://ok, bad\nvalue".to_string(),
+            ..AppConfig::default()
+        };
+        let origins = cors_origins(&config);
+        assert_eq!(origins.len(), 1);
+        assert_eq!(origins[0], "http://ok");
+    }
+
+    #[test]
+    fn openapi_document_has_service_metadata() {
+        let document = openapi_document();
+        assert_eq!(document.info.title, "Obolargus API");
+        assert!(document.info.description.is_some());
+        assert_eq!(
+            document
+                .servers
+                .as_ref()
+                .expect("servers")
+                .first()
+                .expect("server")
+                .url,
+            "../.."
+        );
+        assert!(
+            document
+                .tags
+                .as_ref()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag.name == "data-dictionary")
+        );
+    }
+
+    #[test]
+    fn build_market_data_registry_reports_invalid_configuration() {
+        let config = AppConfig {
+            market_data_sources: "not json".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(build_market_data_registry(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_database_without_a_url_is_none() {
+        assert!(connect_database(None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_database_with_an_unreachable_url_is_none() {
+        assert!(
+            connect_database(Some("postgres://user:pass@127.0.0.1:1/db"))
+                .await
+                .is_none()
+        );
+    }
+}
