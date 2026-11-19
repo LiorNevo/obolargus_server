@@ -9,6 +9,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use obolargus_core::common::tx_pool;
+use obolargus_core::morpheus::model::ToolCallStatus;
 use obolargus_core::morpheus::persistence;
 use obolargus_server::config::AppConfig;
 use obolargus_server::{AppState, router};
@@ -525,4 +526,246 @@ async fn status_reports_a_healthy_provider() {
     assert!(body["last_error"].is_null());
     assert_eq!(body["vision_model"], "vision-model");
     drop(guard);
+}
+
+/// Seeds a turn with an approval-protected tool call plus one extra
+/// pending approval. The extra approval keeps `resume_if_ready` from
+/// starting the engine for decisions that only resolve one call.
+async fn seed_approval(
+    pool: &sqlx::PgPool,
+    actor: &str,
+    suffix: &str,
+    expires_in_seconds: u64,
+) -> (Uuid, Uuid, Uuid) {
+    // One turn per conversation: the schema allows a single active turn
+    // (`running` / `awaiting_*`) per conversation, and the resume path
+    // below moves the decided turn to `running`.
+    let conversation = persistence::create_conversation(pool, actor, Uuid::new_v4())
+        .await
+        .expect("conversation");
+    let (_, _, turn) = persistence::create_turn(
+        pool,
+        actor,
+        conversation.id,
+        "approval decision",
+        &format!("approval-message-{suffix}"),
+    )
+    .await
+    .expect("turn");
+    let tool = persistence::insert_tool_call(
+        pool,
+        turn.id,
+        &format!("approval-call-{suffix}"),
+        "assets.search",
+        1,
+        json!({ "query": "AAPL" }),
+        "search AAPL",
+        "read",
+        "awaiting_approval",
+    )
+    .await
+    .expect("tool call");
+    let approval = persistence::create_approval(
+        pool,
+        turn.id,
+        "tool",
+        tool.id,
+        &format!("context-{suffix}"),
+        expires_in_seconds,
+    )
+    .await
+    .expect("approval");
+    let blocker = persistence::insert_tool_call(
+        pool,
+        turn.id,
+        &format!("approval-blocker-{suffix}"),
+        "assets.search",
+        1,
+        json!({}),
+        "search",
+        "read",
+        "awaiting_approval",
+    )
+    .await
+    .expect("blocker call");
+    persistence::create_approval(
+        pool,
+        turn.id,
+        "tool",
+        blocker.id,
+        &format!("blocker-context-{suffix}"),
+        300,
+    )
+    .await
+    .expect("blocker approval");
+    (turn.id, tool.id, approval.id)
+}
+
+#[tokio::test]
+async fn approval_decisions_cover_individual_turn_standing_and_expired_paths() {
+    let Some((pool, guard)) = tx_pool().await else {
+        return;
+    };
+    let actor = format!("morpheus-approvals-{}", Uuid::new_v4());
+    let state = AppState::new(enabled_config(&actor), Some(pool.clone())).expect("state");
+    let app = router(state);
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/api/morpheus/conversations",
+        Some(json!({ "client_conversation_id": Uuid::new_v4() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created["id"].is_string());
+
+    // Unknown decisions are rejected before any database lookup.
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{}", Uuid::new_v4()),
+        Some(json!({ "decision": "maybe" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    // Approve a single tool call.
+    let (turn_id, tool_id, approval_id) = seed_approval(&pool, &actor, "approve", 300).await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{approval_id}"),
+        Some(json!({ "decision": "approve" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["approval"]["status"], "approved");
+    assert_eq!(body["approval"]["decision_mode"], "individual");
+    let stored = persistence::get_tool_call(&pool, turn_id, tool_id)
+        .await
+        .expect("tool call");
+    assert_eq!(stored.status, ToolCallStatus::Approved.as_str());
+
+    // A second decision on the same approval is a no-op that returns the
+    // already-decided row instead of re-applying the transition.
+    let (status, repeated) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{approval_id}"),
+        Some(json!({ "decision": "deny" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated["approval"]["status"], "approved");
+
+    // Deny another call.
+    let (turn_id, tool_id, approval_id) = seed_approval(&pool, &actor, "deny", 300).await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{approval_id}"),
+        Some(json!({ "decision": "deny" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["approval"]["status"], "denied");
+    assert_eq!(body["approval"]["decision_mode"], "individual");
+    let stored = persistence::get_tool_call(&pool, turn_id, tool_id)
+        .await
+        .expect("tool call");
+    assert_eq!(stored.status, ToolCallStatus::Denied.as_str());
+
+    // Approve every pending call in a turn.
+    let (turn_id, _tool_id, approval_id) = seed_approval(&pool, &actor, "turn", 300).await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{approval_id}"),
+        Some(json!({ "decision": "approve_all_turn" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["approval"]["decision_mode"], "turn");
+    let pending = persistence::list_pending_approvals(&pool, turn_id)
+        .await
+        .expect("pending");
+    assert!(pending.is_empty(), "the whole turn should be approved");
+
+    // Approve every pending call and remember a standing grant.
+    let (_turn_id, _tool_id, approval_id) = seed_approval(&pool, &actor, "standing", 300).await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{approval_id}"),
+        Some(json!({ "decision": "approve_all_remember" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "approve_all_remember: {body}");
+    let standing = &body["standing_approval"];
+    assert!(standing["id"].is_string());
+    assert!(
+        standing["tool_ids"]
+            .as_array()
+            .expect("tool ids")
+            .iter()
+            .any(|id| id == "assets.search")
+    );
+    assert_eq!(standing["ui_action_kinds"][0], "navigate");
+
+    let (status, listed) = get(&app, "/api/morpheus/approvals/standing").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["active"]["id"], standing["id"]);
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!(
+            "/api/morpheus/approvals/standing/{}",
+            standing["id"].as_str().expect("standing id")
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // An expired approval is marked expired, its tool call is expired, and
+    // the request reports a conflict.
+    let (_turn_id, _tool_id, approval_id) = seed_approval(&pool, &actor, "expired", 0).await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/morpheus/approvals/{approval_id}"),
+        Some(json!({ "decision": "approve" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "approval_expired");
+    let expired = persistence::get_approval(&pool, approval_id)
+        .await
+        .expect("expired approval");
+    assert_eq!(expired.status, "expired");
+
+    // Standing decisions are rejected when the deployment disables them.
+    let disabled = router(
+        AppState::new(
+            AppConfig {
+                morpheus_standing_approvals_enabled: false,
+                ..enabled_config(&actor)
+            },
+            Some(pool.clone()),
+        )
+        .expect("state"),
+    );
+    let (status, body) = call(
+        &disabled,
+        "POST",
+        &format!("/api/morpheus/approvals/{}", Uuid::new_v4()),
+        Some(json!({ "decision": "approve_all_remember" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    guard.cleanup().await;
 }
