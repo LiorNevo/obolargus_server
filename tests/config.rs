@@ -9,7 +9,9 @@ use std::process::Command;
 fn refuses_to_start_when_auth_enabled_without_jwt_secret() {
     let output = Command::new(env!("CARGO_BIN_EXE_obolargus-server"))
         .env("AUTH_ENABLED", "true")
-        .env_remove("JWT_SECRET")
+        // An empty value overrides any JWT_SECRET in a local `.env`, which
+        // dotenvy loads but does not let override the process environment.
+        .env("JWT_SECRET", "")
         .output()
         .unwrap();
 

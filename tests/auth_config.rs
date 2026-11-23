@@ -35,18 +35,20 @@ fn missing_google_client_id_refuses_to_start() {
 }
 
 #[test]
-fn missing_allowlist_refuses_to_start() {
+fn an_empty_allowlist_starts_with_the_primary_owner() {
     let config = AppConfig {
-        google_allowed_emails: " , ".to_string(),
+        google_allowed_emails: String::new(),
         ..enabled_config()
     };
-    assert!(startup_error(config).contains("GOOGLE_ALLOWED_EMAILS"));
+    let settings = AuthSettings::from_config(&config).expect("empty allowlist is allowed");
+    assert!(settings.allows("alice@example.com"));
+    assert!(!settings.allows("bob@example.com"));
 }
 
 #[test]
 fn an_invalid_allowlist_refuses_to_start() {
     let config = AppConfig {
-        google_allowed_emails: "only@example.com".to_string(),
+        google_allowed_emails: "not-an-email".to_string(),
         ..enabled_config()
     };
     assert!(startup_error(config).contains("GOOGLE_ALLOWED_EMAILS"));
@@ -62,12 +64,14 @@ fn missing_jwt_secret_refuses_to_start() {
 }
 
 #[test]
-fn a_primary_owner_outside_the_allowlist_refuses_to_start() {
+fn a_primary_owner_outside_the_allowlist_is_still_allowed() {
     let config = AppConfig {
         primary_owner_email: "carol@example.com".to_string(),
         ..enabled_config()
     };
-    assert!(startup_error(config).contains("PRIMARY_OWNER_EMAIL"));
+    let settings = AuthSettings::from_config(&config).expect("primary is always allowed");
+    assert!(settings.allows("carol@example.com"));
+    assert!(settings.allows("alice@example.com"));
 }
 
 #[test]

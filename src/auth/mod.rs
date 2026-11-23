@@ -89,22 +89,17 @@ impl AuthSettings {
             return Err(AuthConfigError::MissingJwtSecret);
         }
 
-        let emails = parse_allowlist(&config.google_allowed_emails)?;
-        let first = emails
-            .first()
-            .cloned()
-            .ok_or(AuthConfigError::MissingAllowlist)?;
-        let primary_owner_email = {
-            let configured = config.primary_owner_email.trim();
-            if configured.is_empty() {
-                first
-            } else {
-                configured.to_ascii_lowercase()
-            }
+        let mut emails = parse_allowlist(&config.google_allowed_emails)?;
+        let configured_primary = normalize_email(&config.primary_owner_email);
+        let primary_owner_email = if configured_primary.is_empty() {
+            emails
+                .first()
+                .cloned()
+                .ok_or(AuthConfigError::MissingAllowlist)?
+        } else {
+            configured_primary
         };
-        if !emails.contains(&primary_owner_email) {
-            return Err(AuthConfigError::PrimaryOwnerNotAllowlisted);
-        }
+        emails.insert(primary_owner_email.clone());
 
         Ok(Self {
             enabled: true,
@@ -117,7 +112,7 @@ impl AuthSettings {
         })
     }
 
-    /// Whether `email` is on the allowlist (case-insensitive).
+    /// Whether `email` may sign in: the allowlist plus the primary owner.
     pub fn allows(&self, email: &str) -> bool {
         self.allowed_emails.contains(&normalize_email(email))
     }
@@ -130,14 +125,13 @@ pub enum AuthConfigError {
     UnauthenticatedPublicBind,
     /// `AUTH_ENABLED=true` but `GOOGLE_CLIENT_ID` is empty.
     MissingGoogleClientId,
-    /// `AUTH_ENABLED=true` but the allowlist is empty.
+    /// `AUTH_ENABLED=true` but neither the allowlist nor the primary owner
+    /// is set.
     MissingAllowlist,
-    /// The allowlist is malformed or outside the 2–5 account bound.
+    /// The allowlist is malformed.
     InvalidAllowlist(String),
     /// `AUTH_ENABLED=true` but `JWT_SECRET` is empty.
     MissingJwtSecret,
-    /// The primary owner email is not on the allowlist.
-    PrimaryOwnerNotAllowlisted,
 }
 
 impl fmt::Display for AuthConfigError {
@@ -152,7 +146,7 @@ impl fmt::Display for AuthConfigError {
             }
             Self::MissingAllowlist => write!(
                 f,
-                "AUTH_ENABLED is true but GOOGLE_ALLOWED_EMAILS is not set"
+                "AUTH_ENABLED is true but neither GOOGLE_ALLOWED_EMAILS nor PRIMARY_OWNER_EMAIL is set"
             ),
             Self::InvalidAllowlist(detail) => {
                 write!(f, "GOOGLE_ALLOWED_EMAILS is invalid: {detail}")
@@ -160,10 +154,6 @@ impl fmt::Display for AuthConfigError {
             Self::MissingJwtSecret => {
                 write!(f, "AUTH_ENABLED is true but JWT_SECRET is not set")
             }
-            Self::PrimaryOwnerNotAllowlisted => write!(
-                f,
-                "PRIMARY_OWNER_EMAIL must be one of GOOGLE_ALLOWED_EMAILS"
-            ),
         }
     }
 }
@@ -485,15 +475,6 @@ fn parse_allowlist(raw: &str) -> Result<BTreeSet<String>, AuthConfigError> {
         .map(normalize_email)
         .filter(|email| !email.is_empty())
         .collect();
-    if emails.is_empty() {
-        return Err(AuthConfigError::MissingAllowlist);
-    }
-    if !(2..=5).contains(&emails.len()) {
-        return Err(AuthConfigError::InvalidAllowlist(format!(
-            "expected 2-5 unique addresses, got {}",
-            emails.len()
-        )));
-    }
     for email in &emails {
         if !is_plausible_email(email) {
             return Err(AuthConfigError::InvalidAllowlist(
@@ -601,34 +582,56 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_is_normalized_and_bounded() {
+    fn allowlist_is_normalized_and_unbounded() {
         let settings = AuthSettings::from_config(&config(" Alice@Example.com , BOB@example.com "))
             .expect("valid allowlist");
         assert!(settings.allows("alice@example.com"));
         assert_eq!(settings.primary_owner_email, "alice@example.com");
 
-        assert!(matches!(
-            AuthSettings::from_config(&config("only@example.com")),
-            Err(AuthConfigError::InvalidAllowlist(_))
-        ));
-        assert!(matches!(
-            AuthSettings::from_config(&config("a@x,b@x,c@x,d@x,e@x,f@x")),
-            Err(AuthConfigError::InvalidAllowlist(_))
-        ));
+        assert!(
+            AuthSettings::from_config(&config("only@example.com")).is_ok(),
+            "one account is allowed"
+        );
+        let many = (1..=20)
+            .map(|index| format!("user{index}@example.com"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            AuthSettings::from_config(&config(&many)).is_ok(),
+            "no upper bound"
+        );
         assert!(matches!(
             AuthSettings::from_config(&config("a@x,b@x,not-an-email")),
+            Err(AuthConfigError::InvalidAllowlist(_))
+        ));
+        assert!(matches!(
+            AuthSettings::from_config(&config("a@x,a@x")),
             Err(AuthConfigError::InvalidAllowlist(_))
         ));
     }
 
     #[test]
-    fn primary_owner_must_be_allowlisted() {
-        let mut config = config("a@example.com,b@example.com");
-        config.primary_owner_email = "c@example.com".to_string();
-        assert_eq!(
-            AuthSettings::from_config(&config),
-            Err(AuthConfigError::PrimaryOwnerNotAllowlisted)
-        );
+    fn primary_owner_is_always_allowed() {
+        let base = config("a@example.com,b@example.com");
+        let settings_config = AppConfig {
+            primary_owner_email: "Carol@Example.com".to_string(),
+            ..base.clone()
+        };
+        let settings =
+            AuthSettings::from_config(&settings_config).expect("primary is always allowed");
+        assert_eq!(settings.primary_owner_email, "carol@example.com");
+        assert!(settings.allows("carol@example.com"));
+        assert!(!settings.allows("stranger@example.com"));
+
+        let empty_allowlist = AppConfig {
+            google_allowed_emails: String::new(),
+            primary_owner_email: "primary@example.com".to_string(),
+            ..base
+        };
+        let settings =
+            AuthSettings::from_config(&empty_allowlist).expect("empty allowlist is allowed");
+        assert!(settings.allows("primary@example.com"));
+        assert!(!settings.allows("a@example.com"));
     }
 
     #[test]

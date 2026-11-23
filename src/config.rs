@@ -46,10 +46,12 @@ pub struct AppConfig {
     /// Google OAuth web client id used for the ID-token audience check.
     #[envconfig(from = "GOOGLE_CLIENT_ID", default = "")]
     pub google_client_id: String,
-    /// Comma-separated allowlist of 2–5 verified Google email addresses.
+    /// Comma-separated allowlist of verified Google email addresses; may be
+    /// empty. The primary owner is always allowed.
     #[envconfig(from = "GOOGLE_ALLOWED_EMAILS", default = "")]
     pub google_allowed_emails: String,
     /// Email of the primary actor that owns legacy data and scheduled jobs.
+    /// Always allowed to sign in, even when not on the allowlist.
     #[envconfig(from = "PRIMARY_OWNER_EMAIL", default = "")]
     pub primary_owner_email: String,
     /// Explicit override allowing unauthenticated access on a non-loopback bind.
@@ -543,12 +545,6 @@ impl AppConfig {
                 ));
             }
             let emails = self.google_allowlist();
-            if !(2..=5).contains(&emails.len()) {
-                return Err(ConfigError::Load(format!(
-                    "GOOGLE_ALLOWED_EMAILS must contain 2–5 addresses (got {})",
-                    emails.len()
-                )));
-            }
             if emails.iter().any(|email| !is_valid_email(email)) {
                 return Err(ConfigError::Load(
                     "GOOGLE_ALLOWED_EMAILS contains an invalid email address".to_string(),
@@ -560,9 +556,9 @@ impl AppConfig {
                     "PRIMARY_OWNER_EMAIL must be set when AUTH_ENABLED=true".to_string(),
                 ));
             }
-            if !emails.iter().any(|email| email == &primary) {
+            if !is_valid_email(&primary) {
                 return Err(ConfigError::Load(
-                    "PRIMARY_OWNER_EMAIL must be one of GOOGLE_ALLOWED_EMAILS".to_string(),
+                    "PRIMARY_OWNER_EMAIL must be a valid email address".to_string(),
                 ));
             }
         } else if !self.host_is_loopback() && !self.allow_unauthenticated {
@@ -1120,23 +1116,43 @@ mod tests {
     }
 
     #[test]
-    fn auth_allowlist_and_primary_owner_are_validated() {
+    fn auth_allowlist_accepts_empty_and_unbounded_lists() {
         let mut config = AppConfig {
             auth_enabled: true,
             jwt_secret: "secret".to_string(),
             google_client_id: "client.apps.googleusercontent.com".to_string(),
-            google_allowed_emails: "a@example.com".to_string(),
-            primary_owner_email: "a@example.com".to_string(),
+            google_allowed_emails: String::new(),
+            primary_owner_email: "primary@example.com".to_string(),
             ..AppConfig::default()
         };
 
-        assert!(config.validate().is_err(), "one account is not enough");
+        assert_eq!(config.validate(), Ok(()), "empty allowlist is allowed");
 
-        config.google_allowed_emails = "a@example.com,b@example.com".to_string();
-        assert_eq!(config.validate(), Ok(()));
+        config.google_allowed_emails = "a@example.com".to_string();
+        assert_eq!(config.validate(), Ok(()), "one account is allowed");
 
-        config.primary_owner_email = "c@example.com".to_string();
-        assert!(config.validate().is_err(), "primary must be allowlisted");
+        config.google_allowed_emails = (1..=20)
+            .map(|index| format!("user{index}@example.com"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(config.validate(), Ok(()), "no upper bound");
+
+        config.google_allowed_emails = "not-an-email".to_string();
+        assert!(config.validate().is_err());
+
+        config.google_allowed_emails = String::new();
+        config.primary_owner_email = String::new();
+        assert!(config.validate().is_err(), "primary owner is required");
+
+        config.primary_owner_email = "not-an-email".to_string();
+        assert!(config.validate().is_err(), "primary owner must be an email");
+
+        config.primary_owner_email = "carol@example.com".to_string();
+        assert_eq!(
+            config.validate(),
+            Ok(()),
+            "primary owner need not be allowlisted"
+        );
     }
 
     #[test]

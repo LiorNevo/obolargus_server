@@ -29,15 +29,16 @@ repository. Design: `specs/architecture/`; feature: `specs/001-boilerplate-submo
 Authentication is default-deny. The browser obtains a Google Identity
 Services ID token; `POST /api/auth/login` verifies it (RS256 signature against
 Google's JWKS, issuer, audience, expiry, and `email_verified`), checks the
-2–5 account allowlist, binds the stable Google subject to an actor row, and
-issues a 15-minute HS256 access token plus a 7-day refresh token. There is no
-password storage and no registration surface.
+allowlist or primary owner, binds the stable Google subject to an actor row,
+and issues a 15-minute HS256 access token plus a 7-day refresh token. There is
+no password storage and no registration surface.
 
 `GET /health`, `POST /api/auth/login`, `POST /api/auth/refresh`, and CORS
 preflight are public; Swagger UI, the OpenAPI document, and every API route
 require a bearer access token. When authentication is enabled the server
-refuses to start without `GOOGLE_CLIENT_ID`, `GOOGLE_ALLOWED_EMAILS`, a
-`PRIMARY_OWNER_EMAIL` on that allowlist, `JWT_SECRET`, and a database.
+refuses to start without `GOOGLE_CLIENT_ID`, a `PRIMARY_OWNER_EMAIL`,
+`JWT_SECRET`, and a database. `GOOGLE_ALLOWED_EMAILS` may be empty; the
+primary owner is always allowed.
 `AUTH_ENABLED=false` is loopback-only local development; a non-loopback bind
 also needs `ALLOW_UNAUTHENTICATED=true`. Rotating `JWT_SECRET` invalidates all
 application sessions.
