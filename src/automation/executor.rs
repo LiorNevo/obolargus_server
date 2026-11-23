@@ -77,6 +77,9 @@ pub async fn execute_run(state: AppState, run_id: Uuid) -> Result<(), Automation
         .ok_or_else(|| AutomationError::Infrastructure("database unavailable".to_string()))?
         .clone();
     let run = persistence::get_run(&pool, run_id).await?;
+    let owner_id = persistence::flow_owner_id(&pool, run.flow_id)
+        .await?
+        .ok_or_else(|| AutomationError::NotFound(format!("flow {}", run.flow_id)))?;
     let version = persistence::get_version_by_id(&pool, run.flow_version_id)
         .await?
         .ok_or_else(|| AutomationError::NotFound(format!("version {}", run.flow_version_id)))?;
@@ -144,8 +147,9 @@ pub async fn execute_run(state: AppState, run_id: Uuid) -> Result<(), Automation
     let global_scope_id = "workspace".to_string();
     let flow_scope_id = run.flow_id.to_string();
     let (_, global_records) =
-        persistence::get_context(&pool, &flow_scope_id, &global_scope_id).await?;
-    let scoped_records = persistence::get_scoped_flow_context(&pool, &flow_scope_id).await?;
+        persistence::get_context(&pool, &owner_id, &flow_scope_id, &global_scope_id).await?;
+    let scoped_records =
+        persistence::get_scoped_flow_context(&pool, &owner_id, &flow_scope_id).await?;
     let mut flow_context: BTreeMap<String, Value> = BTreeMap::new();
     let mut scoped_context: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
     for record in scoped_records {
@@ -372,7 +376,7 @@ impl ExecutionObserver for DbObserver {
             return;
         };
         if let Err(error) =
-            persistence::set_context(&self.pool, scope, scope_id, key, &value, Some(self.run_id))
+            persistence::set_context_for_run(&self.pool, self.run_id, scope, scope_id, key, &value)
                 .await
         {
             tracing::warn!(%error, scope, scope_id, key, "context write failed");

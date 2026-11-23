@@ -1,7 +1,7 @@
 //! Turn detail and stop routes.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -10,10 +10,11 @@ use obolargus_core::morpheus::model::{MessageStatus, TurnStatus};
 use obolargus_core::morpheus::persistence;
 
 use super::{
-    ApiError, MessageView, StepView, ToolCallView, TurnSummaryView, UiActionView, actor,
-    require_enabled, require_pool,
+    ApiError, MessageView, StepView, ToolCallView, TurnSummaryView, UiActionView, require_enabled,
+    require_pool,
 };
 use crate::AppState;
+use crate::auth::AuthUser;
 
 /// Full turn projection.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -40,11 +41,12 @@ pub struct TurnDetail {
 )]
 pub async fn get_turn(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(turn_id): Path<Uuid>,
 ) -> Result<Json<TurnDetail>, ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let turn = persistence::get_owned_turn(&pool, actor(&state), turn_id).await?;
+    let turn = persistence::get_owned_turn(&pool, &auth.owner_id, turn_id).await?;
     let agent = persistence::get_turn_agent_message(&pool, turn_id).await?;
     let steps = persistence::list_steps(&pool, turn_id).await?;
     let tool_calls = persistence::list_tool_calls(&pool, turn_id).await?;
@@ -77,11 +79,12 @@ pub struct StopResponse {
 )]
 pub async fn stop_turn(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(turn_id): Path<Uuid>,
 ) -> Result<Json<StopResponse>, ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let turn = persistence::get_owned_turn(&pool, actor(&state), turn_id).await?;
+    let turn = persistence::get_owned_turn(&pool, &auth.owner_id, turn_id).await?;
     if matches!(turn.status.as_str(), "completed" | "stopped" | "failed") {
         return Ok(Json(StopResponse {
             turn_id,
@@ -131,11 +134,12 @@ pub struct RetryResponse {
 )]
 pub async fn retry_turn(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(turn_id): Path<Uuid>,
 ) -> Result<(axum::http::StatusCode, Json<RetryResponse>), ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let (turn, agent) = persistence::retry_turn(&pool, actor(&state), turn_id).await?;
+    let (turn, agent) = persistence::retry_turn(&pool, &auth.owner_id, turn_id).await?;
     crate::morpheus::scheduler::kick(state.clone(), turn.conversation_id);
     Ok((
         axum::http::StatusCode::ACCEPTED,

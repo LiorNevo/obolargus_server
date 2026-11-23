@@ -33,13 +33,18 @@ fn history_load_documents_the_request_and_report_schemas() {
 }
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use obolargus_server::AppState;
+use obolargus_server::auth::AuthUser;
 use obolargus_server::config::AppConfig;
 use obolargus_server::routes::market_data::{HistoryLoadBody, history_load};
 
 fn state_without_pool() -> AppState {
     AppState::new(AppConfig::default(), None).expect("default app state")
+}
+
+fn dev_auth() -> Extension<AuthUser> {
+    Extension(AuthUser::dev())
 }
 
 fn body(from: &str, to: &str) -> HistoryLoadBody {
@@ -54,23 +59,35 @@ fn body(from: &str, to: &str) -> HistoryLoadBody {
 #[tokio::test]
 async fn rejects_invalid_dates_before_consulting_the_pool() {
     let state = state_without_pool();
-    let error = history_load(State(state), Json(body("not-a-date", "2026-01-01")))
-        .await
-        .expect_err("invalid date");
+    let error = history_load(
+        State(state),
+        dev_auth(),
+        Json(body("not-a-date", "2026-01-01")),
+    )
+    .await
+    .expect_err("invalid date");
     assert_eq!(error.0, axum::http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn rejects_reversed_and_future_ranges() {
     let state = state_without_pool();
-    let reversed = history_load(State(state.clone()), Json(body("2026-02-01", "2026-01-01")))
-        .await
-        .expect_err("reversed");
+    let reversed = history_load(
+        State(state.clone()),
+        dev_auth(),
+        Json(body("2026-02-01", "2026-01-01")),
+    )
+    .await
+    .expect_err("reversed");
     assert_eq!(reversed.0, axum::http::StatusCode::BAD_REQUEST);
 
-    let future = history_load(State(state), Json(body("2027-01-01", "2027-02-01")))
-        .await
-        .expect_err("future");
+    let future = history_load(
+        State(state),
+        dev_auth(),
+        Json(body("2027-01-01", "2027-02-01")),
+    )
+    .await
+    .expect_err("future");
     assert_eq!(future.0, axum::http::StatusCode::BAD_REQUEST);
 }
 
@@ -81,6 +98,7 @@ async fn rejects_ranges_longer_than_the_bounded_window() {
     let from = today - chrono::Duration::days(500);
     let error = history_load(
         State(state),
+        dev_auth(),
         Json(body(
             &from.format("%Y-%m-%d").to_string(),
             &today.format("%Y-%m-%d").to_string(),
@@ -97,6 +115,7 @@ async fn valid_requests_reach_the_pool_guard() {
     let today = chrono::Utc::now().date_naive();
     let error = history_load(
         State(state),
+        dev_auth(),
         Json(body(
             &(today - chrono::Duration::days(2))
                 .format("%Y-%m-%d")

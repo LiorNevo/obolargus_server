@@ -1,7 +1,7 @@
 //! Trigger CRUD and API-trigger invocation routes.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use obolargus_core::automation::runtime::persistence;
 use super::runs::{RunAccepted, RunRequest, create_run};
 use super::{ApiResult, api_error, map_error, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::automation::{audit, executor};
 
 /// Trigger projection.
@@ -129,10 +130,14 @@ fn valid_missed(value: &str) -> bool {
 )]
 pub async fn list_triggers(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> ApiResult<TriggerList> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let items = persistence::list_triggers(pool, flow_id)
         .await
         .map_err(map_error)?;
@@ -155,12 +160,13 @@ pub async fn list_triggers(
 )]
 pub async fn create_trigger(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Json(body): Json<CreateTriggerRequest>,
 ) -> Result<(StatusCode, Json<TriggerView>), super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::get_flow(pool, flow_id)
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
         .await
         .map_err(map_error)?;
     if body.kind != "api" {
@@ -190,12 +196,13 @@ pub async fn create_trigger(
         body.enabled,
         &body.overlap_policy,
         &body.missed_policy,
-        &state.config.automation_actor_id,
+        &auth.owner_id,
     )
     .await
     .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "trigger.create",
         "trigger",
         trigger.id,
@@ -218,11 +225,15 @@ pub async fn create_trigger(
 )]
 pub async fn update_trigger(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(trigger_id): Path<Uuid>,
     Json(body): Json<UpdateTriggerRequest>,
 ) -> ApiResult<TriggerView> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_trigger(pool, &auth.owner_id, trigger_id)
+        .await
+        .map_err(map_error)?;
     if let Some(policy) = body.overlap_policy.as_deref()
         && !valid_policy(policy)
     {
@@ -252,6 +263,7 @@ pub async fn update_trigger(
     .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "trigger.update",
         "trigger",
         trigger.id,
@@ -273,11 +285,12 @@ pub async fn update_trigger(
 )]
 pub async fn delete_trigger(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(trigger_id): Path<Uuid>,
 ) -> Result<StatusCode, super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let trigger = persistence::get_trigger(pool, trigger_id)
+    let trigger = persistence::get_owned_trigger(pool, &auth.owner_id, trigger_id)
         .await
         .map_err(map_error)?;
     persistence::delete_trigger(pool, trigger_id)
@@ -285,6 +298,7 @@ pub async fn delete_trigger(
         .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "trigger.delete",
         "trigger",
         trigger_id,
@@ -311,13 +325,14 @@ pub async fn delete_trigger(
 )]
 pub async fn invoke_trigger(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(trigger_id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<RunRequest>,
 ) -> Result<(StatusCode, Json<RunAccepted>), super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let trigger = persistence::get_trigger(pool, trigger_id)
+    let trigger = persistence::get_owned_trigger(pool, &auth.owner_id, trigger_id)
         .await
         .map_err(map_error)?;
     if trigger.kind != "api" {
@@ -337,13 +352,23 @@ pub async fn invoke_trigger(
     let key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok());
-    let run = create_run(&state, trigger.flow_id, &body, Some(trigger.id), "api", key).await?;
+    let run = create_run(
+        &state,
+        &auth.owner_id,
+        trigger.flow_id,
+        &body,
+        Some(trigger.id),
+        "api",
+        key,
+    )
+    .await?;
     let number = persistence::get_version_by_id(pool, run.flow_version_id)
         .await
         .map_err(map_error)?
         .and_then(|version| version.version_number);
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "trigger.invoke",
         "trigger",
         trigger.id,

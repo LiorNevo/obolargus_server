@@ -1,7 +1,7 @@
 //! Run creation, detail, cancel, and retry routes.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use obolargus_core::automation::runtime::persistence;
 
 use super::{ApiResult, Page, Pagination, api_error, map_error, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::automation::{audit, executor};
 
 /// Body of a manual or API run request.
@@ -263,9 +264,10 @@ async fn run_detail(pool: &sqlx::PgPool, run: RunRecord) -> Result<RunDetailView
     })
 }
 
-/// Creates a run against a published version.
+/// Creates a run against a published version for `owner_id`.
 pub async fn create_run(
     state: &AppState,
+    owner_id: &str,
     flow_id: Uuid,
     body: &RunRequest,
     trigger_id: Option<Uuid>,
@@ -273,7 +275,7 @@ pub async fn create_run(
     idempotency_key: Option<&str>,
 ) -> Result<RunRecord, super::ApiError> {
     let pool = require_pool(state)?;
-    let (flow, _) = persistence::get_flow(pool, flow_id)
+    let (flow, _) = persistence::get_owned_flow(pool, owner_id, flow_id)
         .await
         .map_err(map_error)?;
     if flow.status != "active" {
@@ -411,14 +413,15 @@ pub async fn create_run(
             ));
         }
     }
-    let run = persistence::insert_run(
+    let run = persistence::insert_run_for_owner(
         pool,
+        owner_id,
         flow_id,
         version.id,
         trigger_id,
         trigger_kind,
         body.inject_node_id.as_deref(),
-        Some(&state.config.automation_actor_id),
+        Some(owner_id),
         &inputs,
         idempotency_key,
         None,
@@ -443,6 +446,7 @@ pub async fn create_run(
 )]
 pub async fn start_run(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<RunRequest>,
@@ -451,7 +455,7 @@ pub async fn start_run(
     let key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok());
-    let run = create_run(&state, flow_id, &body, None, "manual", key).await?;
+    let run = create_run(&state, &auth.owner_id, flow_id, &body, None, "manual", key).await?;
     let number = {
         let pool = require_pool(&state)?;
         version_number(pool, run.flow_version_id)
@@ -460,6 +464,7 @@ pub async fn start_run(
     };
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "run.start",
         "run",
         run.id,
@@ -490,6 +495,7 @@ pub async fn start_run(
 )]
 pub async fn list_runs(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Query(query): Query<RunListQuery>,
 ) -> ApiResult<Page<RunSummaryView>> {
     require_enabled(&state)?;
@@ -499,8 +505,9 @@ pub async fn list_runs(
         offset: query.offset,
     }
     .bounds();
-    let runs = persistence::list_runs(
+    let runs = persistence::list_runs_for_owner(
         pool,
+        &auth.owner_id,
         query.flow_id,
         query.status.as_deref(),
         query.trigger_kind.as_deref(),
@@ -509,8 +516,9 @@ pub async fn list_runs(
     )
     .await
     .map_err(map_error)?;
-    let total = persistence::count_runs(
+    let total = persistence::count_runs_for_owner(
         pool,
+        &auth.owner_id,
         query.flow_id,
         query.status.as_deref(),
         query.trigger_kind.as_deref(),
@@ -519,7 +527,7 @@ pub async fn list_runs(
     .map_err(map_error)?;
     let mut items = Vec::with_capacity(runs.len());
     for run in runs {
-        let flow_name = persistence::get_flow(pool, run.flow_id)
+        let flow_name = persistence::get_owned_flow(pool, &auth.owner_id, run.flow_id)
             .await
             .map(|(flow, _)| flow.name)
             .unwrap_or_default();
@@ -559,11 +567,12 @@ pub async fn list_runs(
 )]
 pub async fn get_run(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(run_id): Path<Uuid>,
 ) -> ApiResult<RunDetailView> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let run = persistence::get_run(pool, run_id)
+    let run = persistence::get_owned_run(pool, &auth.owner_id, run_id)
         .await
         .map_err(map_error)?;
     Ok(Json(run_detail(pool, run).await?))
@@ -583,11 +592,15 @@ pub async fn get_run(
 )]
 pub async fn get_node(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path((run_id, node_id)): Path<(Uuid, String)>,
     Query(query): Query<NodeQuery>,
 ) -> ApiResult<NodeDetailView> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_run(pool, &auth.owner_id, run_id)
+        .await
+        .map_err(map_error)?;
     let rows = persistence::list_node_runs(pool, run_id)
         .await
         .map_err(map_error)?;
@@ -642,16 +655,18 @@ pub struct CancelResponse {
 )]
 pub async fn cancel_run(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(run_id): Path<Uuid>,
 ) -> ApiResult<CancelResponse> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let run = persistence::request_cancel(pool, run_id)
+    let run = persistence::request_cancel_for_owner(pool, &auth.owner_id, run_id)
         .await
         .map_err(map_error)?;
     state.automation.cancel(run_id);
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "run.cancel",
         "run",
         run_id,
@@ -678,12 +693,13 @@ pub async fn cancel_run(
 )]
 pub async fn retry_run(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(run_id): Path<Uuid>,
     Json(body): Json<RunRequest>,
 ) -> Result<(StatusCode, Json<RunAccepted>), super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let original = persistence::get_run(pool, run_id)
+    let original = persistence::get_owned_run(pool, &auth.owner_id, run_id)
         .await
         .map_err(map_error)?;
     if !matches!(
@@ -716,6 +732,7 @@ pub async fn retry_run(
     };
     let run = create_run(
         &state,
+        &auth.owner_id,
         original.flow_id,
         &retry,
         original.trigger_id,
@@ -723,7 +740,7 @@ pub async fn retry_run(
         None,
     )
     .await?;
-    let parent = persistence::get_run(pool, run.id)
+    let parent = persistence::get_owned_run(pool, &auth.owner_id, run.id)
         .await
         .map_err(map_error)?;
     let _ = persistence::set_run_parent(pool, run.id, Some(run_id)).await;
@@ -732,6 +749,7 @@ pub async fn retry_run(
         .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "run.retry",
         "run",
         run.id,

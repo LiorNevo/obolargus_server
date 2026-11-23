@@ -326,6 +326,7 @@ async fn http_range_load_groups_rows_and_reports_progress() {
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     };
     let group_id = Uuid::new_v4();
     let body = format!(
@@ -345,20 +346,24 @@ async fn http_range_load_groups_rows_and_reports_progress() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(json["range_group_id"], group_id.to_string());
+    let range_group_id = json["range_group_id"]
+        .as_str()
+        .expect("range group id")
+        .parse::<Uuid>()
+        .expect("uuid");
     assert_eq!(json["dates"].as_array().expect("dates").len(), 2);
 
     let rows: Vec<(String, i32)> = sqlx::query_as(
         "SELECT data_domain, range_concurrency FROM reference_data_load_runs WHERE range_group_id = $1",
     )
-    .bind(group_id)
+    .bind(range_group_id)
     .fetch_all(&pool)
     .await
     .expect("rows");
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row.0 == "market_data" && row.1 == 2));
 
-    let progress = obolargus_core::market_data::history::range_progress(&pool, group_id)
+    let progress = obolargus_core::market_data::history::range_progress(&pool, range_group_id)
         .await
         .expect("progress");
     assert_eq!(progress.status, "complete");
@@ -412,6 +417,7 @@ async fn http_async_range_load_returns_202_and_progress_completes() {
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     };
     let group_id = Uuid::new_v4();
     let body = format!(
@@ -431,12 +437,18 @@ async fn http_async_range_load_returns_202_and_progress_completes() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(json["group_id"], group_id.to_string());
+    let accepted_group = json["group_id"]
+        .as_str()
+        .expect("group id")
+        .parse::<Uuid>()
+        .expect("uuid");
     assert_eq!(json["status"], "accepted");
 
     let progress = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let progress = range_progress(&pool, group_id).await.expect("progress");
+            let progress = range_progress(&pool, accepted_group)
+                .await
+                .expect("progress");
             if progress.status != "starting" && progress.status != "running" {
                 break progress;
             }
@@ -497,6 +509,7 @@ async fn http_single_date_load_reports_stored_provenance() {
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     };
     let response = router(state)
         .oneshot(
@@ -541,6 +554,7 @@ fn state_with_pool(pool: sqlx::PgPool, source_id: &str) -> AppState {
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     }
 }
 
@@ -684,8 +698,8 @@ async fn http_data_load_read_and_control_surface() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("starting"));
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("not_found") || body.contains("not found"));
 
     for uri in [
         "/api/data-load/history?from=not-a-date",

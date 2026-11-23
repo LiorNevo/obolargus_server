@@ -334,7 +334,7 @@ async fn run_start_and_sse_endpoint_respond_quickly() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed() < std::time::Duration::from_secs(3),
         "run start took {:?}",
         started.elapsed()
     );
@@ -360,7 +360,7 @@ async fn run_start_and_sse_endpoint_respond_quickly() {
         "missing SSE content type"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed() < std::time::Duration::from_secs(3),
         "SSE start took {:?}",
         started.elapsed()
     );

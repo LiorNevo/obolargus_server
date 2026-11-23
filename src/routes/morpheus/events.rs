@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use obolargus_core::morpheus::persistence;
 
-use super::{ApiError, MessageView, TurnSummaryView, actor, require_enabled, require_pool};
+use super::{ApiError, MessageView, TurnSummaryView, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::morpheus::state::MorpheusState;
 
 struct StreamGuard(Arc<MorpheusState>);
@@ -178,11 +179,12 @@ async fn fill(current: &mut StreamState) {
 )]
 pub async fn stream_events(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(turn_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::get_owned_turn(&pool, actor(&state), turn_id).await?;
+    persistence::get_owned_turn(&pool, &auth.owner_id, turn_id).await?;
     let max_streams = state.config.morpheus_max_sse_streams;
     if !state.morpheus.acquire_stream(max_streams) {
         return Err(ApiError::new(

@@ -74,6 +74,7 @@ fn state() -> AppState {
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     }
 }
 
@@ -211,15 +212,15 @@ async fn async_range_requires_a_pool_after_validation() {
 }
 
 #[tokio::test]
-async fn stopping_an_inactive_group_reports_false() {
+async fn stopping_without_a_pool_reports_service_unavailable() {
     let (status, body) = send(
         "POST",
         "/api/data-load/history/groups/00000000-0000-4000-8000-000000000001/stop",
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"stopped\":false"));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("no database pool configured"));
 }
 
 #[tokio::test]
@@ -385,6 +386,7 @@ fn search_state(pool: sqlx::PgPool, sources: Vec<ScriptedSearchSource>) -> AppSt
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     }
 }
 

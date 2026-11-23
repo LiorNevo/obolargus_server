@@ -167,6 +167,7 @@ async fn data_load_history_tool_executes_against_the_database() {
     let outcome = obolargus_server::morpheus::tools::execute(
         &state,
         &pool,
+        "dev-user",
         "data_load.history",
         &json!({ "limit": 5 }),
     )

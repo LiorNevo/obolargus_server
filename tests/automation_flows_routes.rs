@@ -504,12 +504,28 @@ async fn context_reads_and_deletes_flow_and_global_values() {
     };
     let state = state(Some(pool.clone()));
     let flow_id = create_flow(&state, "context").await;
-    persistence::set_context(&pool, "flow", &flow_id, "alpha", &json!(1), None)
-        .await
-        .expect("flow context");
-    persistence::set_context(&pool, "global", "workspace", "beta", &json!(2), None)
-        .await
-        .expect("global context");
+    persistence::set_context(
+        &pool,
+        "dev-user",
+        "flow",
+        &flow_id,
+        "alpha",
+        &json!(1),
+        None,
+    )
+    .await
+    .expect("flow context");
+    persistence::set_context(
+        &pool,
+        "dev-user",
+        "global",
+        "workspace",
+        "beta",
+        &json!(2),
+        None,
+    )
+    .await
+    .expect("global context");
 
     let (status, view) = send(
         state.clone(),

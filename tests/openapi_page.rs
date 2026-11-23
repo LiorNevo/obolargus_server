@@ -103,6 +103,8 @@ async fn openapi_document_is_served_as_json_with_every_registered_path() {
         paths,
         [
             "/api/assets",
+            "/api/auth/login",
+            "/api/auth/refresh",
             "/api/automation/flows",
             "/api/automation/flows/{flow_id}",
             "/api/automation/flows/{flow_id}/archive",

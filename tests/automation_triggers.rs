@@ -142,7 +142,15 @@ async fn api_trigger_invocation_is_idempotent_and_honors_disable() {
     let Some(pool) = migrated_pool().await else {
         return;
     };
-    let state = state(Some(pool));
+    // A prior test binary can leave queued/running rows behind; they count
+    // against the global concurrency limit. This test only exercises
+    // idempotency, so lift the limit rather than depend on a clean database.
+    let config = obolargus_server::config::AppConfig {
+        automation_max_concurrent_runs: 1_000,
+        automation_max_concurrent_runs_per_flow: 1_000,
+        ..obolargus_server::config::AppConfig::default()
+    };
+    let state = AppState::new(config, Some(pool)).expect("app state");
     let Some(flow_id) = create_and_publish(&state, sample_flow()).await else {
         panic!("flow setup failed");
     };

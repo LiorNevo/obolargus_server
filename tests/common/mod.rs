@@ -4,6 +4,10 @@
 //! helpers keep the tests focused on the response contract by decoding the
 //! body when the response says it is gzip-encoded.
 
+#![allow(dead_code)]
+
+pub mod auth;
+
 use std::io::Read;
 
 use axum::body::Body;

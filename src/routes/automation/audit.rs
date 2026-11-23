@@ -1,7 +1,7 @@
 //! Audit event route.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +12,7 @@ use obolargus_core::automation::runtime::persistence;
 
 use super::{ApiResult, Page, Pagination, map_error, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 
 /// Audit list query.
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
@@ -82,11 +83,15 @@ impl From<AuditEventRecord> for AuditEventView {
 )]
 pub async fn list_audit(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Page<AuditEventView>> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let (limit, offset) = Pagination {
         limit: query.limit,
         offset: query.offset,

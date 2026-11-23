@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Sse};
 use chrono::Utc;
@@ -19,6 +19,7 @@ use obolargus_core::automation::runtime::persistence;
 
 use super::{ApiError, api_error, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 
 impl Drop for StreamState {
     fn drop(&mut self) {
@@ -256,11 +257,12 @@ async fn fill(state: &mut StreamState) {
 )]
 pub async fn stream_events(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(run_id): Path<Uuid>,
 ) -> Result<axum::response::Response, ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::get_run(pool, run_id)
+    persistence::get_owned_run(pool, &auth.owner_id, run_id)
         .await
         .map_err(|_| api_error(axum::http::StatusCode::NOT_FOUND, "not_found", "run"))?;
 

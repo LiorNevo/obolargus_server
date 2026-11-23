@@ -29,13 +29,14 @@ pub struct ToolOutcome {
 pub async fn execute(
     state: &AppState,
     pool: &sqlx::PgPool,
+    owner_id: &str,
     tool_id: &str,
     arguments: &Value,
 ) -> Result<ToolOutcome, MorpheusError> {
     match tool_id {
         "assets.search" => assets_search(pool, arguments).await,
         "market_data.lookup" => market_lookup(state, arguments).await,
-        "data_load.history" => data_load_history(state, pool, arguments).await,
+        "data_load.history" => data_load_history(state, pool, owner_id, arguments).await,
         other => Err(MorpheusError::tool(
             ErrorCode::ToolFailed,
             format!("tool is not implemented: {other}"),
@@ -89,6 +90,7 @@ async fn assets_search(
 async fn data_load_history(
     state: &AppState,
     pool: &sqlx::PgPool,
+    owner_id: &str,
     arguments: &Value,
 ) -> Result<ToolOutcome, MorpheusError> {
     let limit = arguments
@@ -103,6 +105,7 @@ async fn data_load_history(
         source: string_argument(arguments, "source"),
         status: string_argument(arguments, "status"),
         entry_type: string_argument(arguments, "entry_type"),
+        owner_id: Some(owner_id.to_string()),
         limit,
         offset: 0,
     };
@@ -268,7 +271,7 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://user:pass@127.0.0.1:1/db")
             .expect("lazy pool");
-        let error = execute(&state, &pool, "unknown.tool", &json!({}))
+        let error = execute(&state, &pool, "dev-user", "unknown.tool", &json!({}))
             .await
             .expect_err("unknown tool fails");
         assert_eq!(error.code(), ErrorCode::ToolFailed);

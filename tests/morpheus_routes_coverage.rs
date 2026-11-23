@@ -320,6 +320,7 @@ async fn database_bootstrap_and_tool_paths_are_covered() {
     let outcome = obolargus_server::morpheus::tools::execute(
         &state,
         &pool,
+        "dev-user",
         "assets.search",
         &json!({ "query": "AAPL", "limit": 5 }),
     )
@@ -332,7 +333,8 @@ async fn database_bootstrap_and_tool_paths_are_covered() {
         &pool,
         "api",
         Some("yahoo_finance"),
-        &obolargus_core::market_data::audit::LoadRunContext::market_data(Some(today)),
+        &obolargus_core::market_data::audit::LoadRunContext::market_data(Some(today))
+            .with_owner("dev-user"),
     )
     .await
     .expect("start load run");
@@ -352,6 +354,7 @@ async fn database_bootstrap_and_tool_paths_are_covered() {
     let history = obolargus_server::morpheus::tools::execute(
         &state,
         &pool,
+        "dev-user",
         "data_load.history",
         &json!({
             "from": today.to_string(),

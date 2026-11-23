@@ -100,6 +100,7 @@ fn state_with(providers: Vec<LookupProvider>) -> AppState {
             obolargus_server::morpheus::state::MorpheusState::new(&AppConfig::default())
                 .expect("morpheus"),
         ),
+        auth: std::sync::Arc::new(obolargus_server::auth::AuthState::dev()),
     }
 }
 
@@ -495,7 +496,7 @@ async fn load_rejects_a_malformed_identifier() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let text = body_text(response).await;
-    assert!(text.contains("validation error"), "body: {text}");
+    assert!(text.contains("validation_error"), "body: {text}");
 }
 
 /// A future date is a caller-input validation failure.
@@ -572,7 +573,7 @@ async fn load_rejects_an_identifier_without_a_type() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let text = body_text(response).await;
-    assert!(text.contains("validation error"), "body: {text}");
+    assert!(text.contains("validation_error"), "body: {text}");
 }
 
 /// The identifier input accepts both the string form and the explicit
@@ -656,14 +657,17 @@ async fn load_range_rejects_a_reversed_range() {
 /// A future end date is rejected before the pool is consulted.
 #[tokio::test]
 async fn load_range_rejects_a_future_end_date() {
-    let future = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
+    let future = (chrono::Utc::now().date_naive() + chrono::Duration::days(2))
         .format("%Y-%m-%d")
         .to_string();
     let body =
         format!(r#"{{"identifiers": ["TICKER:AAPL"], "from": "2026-10-01", "to": "{future}"}}"#);
     let (status, text) = post_load_range(&body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(text.contains("later than today"), "body: {text}");
+    assert!(
+        text.contains("more than one day in the future"),
+        "body: {text}"
+    );
 }
 
 /// A zero or oversized window is rejected.

@@ -306,7 +306,8 @@ async fn handle_tool_calls(
     turn: &TurnRecord,
     tools: &[AccumulatedTool],
 ) -> Result<(), MorpheusError> {
-    let standing = persistence::get_active_standing(pool, &state.config.morpheus_actor_id).await?;
+    let owner_id = persistence::conversation_owner(pool, turn.conversation_id).await?;
+    let standing = persistence::get_active_standing(pool, &owner_id).await?;
     let existing = persistence::list_tool_calls(pool, turn.id).await?;
     let mut count = existing.len() as u32;
 
@@ -427,10 +428,11 @@ async fn execute_approved_tools(
     turn: &TurnRecord,
 ) -> Result<(), MorpheusError> {
     let calls = persistence::list_tool_calls(pool, turn.id).await?;
+    let owner_id = persistence::conversation_owner(pool, turn.conversation_id).await?;
     for call in calls {
         match call.status.as_str() {
             "approved" => {
-                run_tool(state, pool, &call).await?;
+                run_tool(state, pool, &owner_id, &call).await?;
             }
             "denied" | "expired" => {
                 let message = if call.status == "denied" {
@@ -458,6 +460,7 @@ async fn execute_approved_tools(
 async fn run_tool(
     state: &AppState,
     pool: &sqlx::PgPool,
+    owner_id: &str,
     call: &ToolCallRecord,
 ) -> Result<(), MorpheusError> {
     persistence::start_tool_call(pool, call.id).await?;
@@ -473,7 +476,7 @@ async fn run_tool(
     .await?;
     let outcome = timeout(
         Duration::from_secs(state.config.morpheus_tool_timeout_seconds.max(1)),
-        crate::morpheus::tools::execute(state, pool, &call.tool_id, &call.arguments),
+        crate::morpheus::tools::execute(state, pool, owner_id, &call.tool_id, &call.arguments),
     )
     .await;
     match outcome {

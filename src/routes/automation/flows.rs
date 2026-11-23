@@ -1,7 +1,7 @@
 //! Flow CRUD, draft, validation, and context routes.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use obolargus_core::automation::templates;
 
 use super::{ApiResult, Page, Pagination, api_error, map_error, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::automation::audit;
 
 /// Last-run projection in a flow summary.
@@ -203,6 +204,7 @@ async fn flow_detail(
 )]
 pub async fn list_flows(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Query(query): Query<FlowListQuery>,
 ) -> ApiResult<Page<FlowSummary>> {
     require_enabled(&state)?;
@@ -212,8 +214,9 @@ pub async fn list_flows(
         offset: query.offset,
     }
     .bounds();
-    let flows = persistence::list_flows(
+    let flows = persistence::list_flows_for_owner(
         pool,
+        &auth.owner_id,
         query.status.as_deref(),
         query.search.as_deref(),
         limit,
@@ -221,9 +224,14 @@ pub async fn list_flows(
     )
     .await
     .map_err(map_error)?;
-    let total = persistence::count_flows(pool, query.status.as_deref(), query.search.as_deref())
-        .await
-        .map_err(map_error)?;
+    let total = persistence::count_flows_for_owner(
+        pool,
+        &auth.owner_id,
+        query.status.as_deref(),
+        query.search.as_deref(),
+    )
+    .await
+    .map_err(map_error)?;
     let mut items = Vec::with_capacity(flows.len());
     for flow in flows {
         let current_version_number = match flow.current_published_version_id {
@@ -275,6 +283,7 @@ pub async fn list_flows(
 )]
 pub async fn create_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Json(body): Json<CreateFlowRequest>,
 ) -> Result<(StatusCode, Json<FlowDetail>), super::ApiError> {
     require_enabled(&state)?;
@@ -332,7 +341,7 @@ pub async fn create_flow(
     };
     let flow = persistence::create_flow(
         pool,
-        &state.config.automation_actor_id,
+        &auth.owner_id,
         name,
         &body.description,
         &body.tags,
@@ -342,6 +351,7 @@ pub async fn create_flow(
     .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "flow.create",
         "flow",
         flow.id,
@@ -350,7 +360,7 @@ pub async fn create_flow(
         json!({ "name": flow.name }),
     )
     .await;
-    let (flow, draft) = persistence::get_flow(pool, flow.id)
+    let (flow, draft) = persistence::get_owned_flow(pool, &auth.owner_id, flow.id)
         .await
         .map_err(map_error)?;
     let detail = flow_detail(pool, flow, draft).await?;
@@ -370,11 +380,12 @@ pub async fn create_flow(
 )]
 pub async fn get_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> ApiResult<FlowDetail> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let (flow, draft) = persistence::get_flow(pool, flow_id)
+    let (flow, draft) = persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
         .await
         .map_err(map_error)?;
     Ok(Json(flow_detail(pool, flow, draft).await?))
@@ -394,11 +405,15 @@ pub async fn get_flow(
 )]
 pub async fn update_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Json(body): Json<UpdateFlowRequest>,
 ) -> ApiResult<FlowDetail> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     if let Some(name) = body.name.as_deref()
         && (name.trim().is_empty() || name.chars().count() > 200)
     {
@@ -419,6 +434,7 @@ pub async fn update_flow(
     .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "flow.update",
         "flow",
         flow_id,
@@ -427,20 +443,29 @@ pub async fn update_flow(
         json!({}),
     )
     .await;
-    let (flow, draft) = persistence::get_flow(pool, flow.id)
+    let (flow, draft) = persistence::get_owned_flow(pool, &auth.owner_id, flow.id)
         .await
         .map_err(map_error)?;
     Ok(Json(flow_detail(pool, flow, draft).await?))
 }
 
-async fn set_status(state: AppState, flow_id: Uuid, status: &str) -> ApiResult<FlowDetail> {
+async fn set_status(
+    state: AppState,
+    owner_id: &str,
+    flow_id: Uuid,
+    status: &str,
+) -> ApiResult<FlowDetail> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let flow = persistence::set_flow_status(pool, flow_id, status)
         .await
         .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        owner_id,
         &format!("flow.{status}"),
         "flow",
         flow_id,
@@ -449,7 +474,7 @@ async fn set_status(state: AppState, flow_id: Uuid, status: &str) -> ApiResult<F
         json!({}),
     )
     .await;
-    let (flow, draft) = persistence::get_flow(pool, flow.id)
+    let (flow, draft) = persistence::get_owned_flow(pool, owner_id, flow.id)
         .await
         .map_err(map_error)?;
     Ok(Json(flow_detail(pool, flow, draft).await?))
@@ -465,9 +490,10 @@ async fn set_status(state: AppState, flow_id: Uuid, status: &str) -> ApiResult<F
 )]
 pub async fn archive_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> ApiResult<FlowDetail> {
-    set_status(state, flow_id, "archived").await
+    set_status(state, &auth.owner_id, flow_id, "archived").await
 }
 
 /// `POST /api/automation/flows/{flow_id}/restore`
@@ -480,9 +506,10 @@ pub async fn archive_flow(
 )]
 pub async fn restore_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> ApiResult<FlowDetail> {
-    set_status(state, flow_id, "active").await
+    set_status(state, &auth.owner_id, flow_id, "active").await
 }
 
 /// `DELETE /api/automation/flows/{flow_id}`
@@ -495,15 +522,20 @@ pub async fn restore_flow(
 )]
 pub async fn delete_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> Result<StatusCode, super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     persistence::soft_delete_flow(pool, flow_id)
         .await
         .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "flow.delete",
         "flow",
         flow_id,
@@ -594,11 +626,15 @@ fn check_size(state: &AppState, value: &Value) -> Result<(), super::ApiError> {
 )]
 pub async fn save_draft(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Json(body): Json<SaveDraftRequest>,
 ) -> ApiResult<DraftResponse> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     check_size(&state, &body.flow_json)?;
     let document: FlowDocument =
         serde_json::from_value(body.flow_json.clone()).map_err(|error| {
@@ -614,12 +650,13 @@ pub async fn save_draft(
         flow_id,
         body.expected_revision,
         &body.flow_json,
-        &state.config.automation_actor_id,
+        &auth.owner_id,
     )
     .await
     .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "flow.draft.save",
         "flow",
         flow_id,
@@ -666,21 +703,20 @@ pub struct ValidateResponse {
 )]
 pub async fn validate(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Json(body): Json<ValidateRequest>,
 ) -> ApiResult<ValidateResponse> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    let (_, draft) = persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let value = match body.flow_json {
         Some(value) => value,
-        None => {
-            let (_, draft) = persistence::get_flow(pool, flow_id)
-                .await
-                .map_err(map_error)?;
-            draft
-                .map(|draft| draft.flow_json)
-                .ok_or_else(|| api_error(StatusCode::CONFLICT, "conflict", "draft.none"))?
-        }
+        None => draft
+            .map(|draft| draft.flow_json)
+            .ok_or_else(|| api_error(StatusCode::CONFLICT, "conflict", "draft.none"))?,
     };
     let document: FlowDocument = serde_json::from_value(value).map_err(|error| {
         api_error(
@@ -724,12 +760,16 @@ pub struct ContextView {
 )]
 pub async fn get_context(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> ApiResult<ContextView> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let (flow_rows, global_rows) =
-        persistence::get_context(pool, &flow_id.to_string(), "workspace")
+        persistence::get_context(pool, &auth.owner_id, &flow_id.to_string(), "workspace")
             .await
             .map_err(map_error)?;
     let to_map = |rows: Vec<obolargus_core::automation::model::ContextRecord>| {
@@ -755,15 +795,20 @@ pub async fn get_context(
 )]
 pub async fn delete_context(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
 ) -> Result<StatusCode, super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::delete_context(pool, "flow", &flow_id.to_string())
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
+    persistence::delete_context(pool, &auth.owner_id, "flow", &flow_id.to_string())
         .await
         .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "context.delete",
         "flow",
         flow_id,

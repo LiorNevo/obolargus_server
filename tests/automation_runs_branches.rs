@@ -98,7 +98,7 @@ async fn start_run(state: &AppState, flow_id: &str, body: Value) -> (StatusCode,
 }
 
 async fn wait_for_terminal(state: &AppState, run_id: &str) -> Value {
-    for _ in 0..200 {
+    for _ in 0..400 {
         let (status, body) = send(
             state.clone(),
             Method::GET,

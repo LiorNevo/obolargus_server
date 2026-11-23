@@ -15,6 +15,8 @@ use obolargus_server::openapi_document;
 /// are intentionally excluded.
 const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/health"),
+    ("post", "/api/auth/login"),
+    ("post", "/api/auth/refresh"),
     ("get", "/api/assets"),
     ("get", "/api/domain/schema"),
     ("get", "/api/market-data/sources"),
@@ -208,6 +210,7 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
         let tags = operation["tags"].as_array().expect("operation tags");
         assert!(
             tags.iter().any(|tag| tag == "health"
+                || tag == "auth"
                 || tag == "market-data"
                 || tag == "temporal"
                 || tag == "domain"
@@ -334,7 +337,7 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                     ["200", "400", "404", "503"].into_iter().collect()
                 }
                 ("post", "/api/data-load/history/groups/{group_id}/stop") => {
-                    ["200", "400"].into_iter().collect()
+                    ["200", "400", "503"].into_iter().collect()
                 }
                 _ => ["200", "400", "503"].into_iter().collect(),
             };
@@ -468,7 +471,8 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
         }
 
         if *path == "/api/market-data/load-range/async" {
-            let expected: BTreeSet<&str> = ["202", "400", "409", "503"].into_iter().collect();
+            let expected: BTreeSet<&str> =
+                ["202", "400", "409", "429", "503"].into_iter().collect();
             assert_eq!(
                 statuses, expected,
                 "{method} {path} has the wrong documented statuses"
@@ -477,23 +481,76 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 responses["202"]["content"]["application/json"].is_object(),
                 "{method} {path} must document a JSON accepted body"
             );
-            for status in ["400", "409", "503"] {
+            for status in ["400", "409", "429", "503"] {
                 assert!(
-                    responses[status]["content"]["text/plain"].is_object(),
-                    "{method} {path} {status} must document a text/plain error body"
+                    responses[status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON error body"
                 );
             }
             continue;
         }
 
-        let expected: BTreeSet<&str> = match (*method, *path) {
-            ("get", "/health") | ("get", "/api/market-data/sources") => {
-                ["200"].into_iter().collect()
+        if *path == "/api/auth/login" {
+            let expected: BTreeSet<&str> = ["200", "400", "401", "403", "429", "500"]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            for status in expected {
+                assert!(
+                    responses[status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON body"
+                );
             }
-            ("get", "/api/market-data/lookup") => ["200", "400"].into_iter().collect(),
-            _ => ["200", "400", "401", "415", "422", "500", "502", "503"]
+            continue;
+        }
+
+        if *path == "/api/auth/refresh" {
+            let expected: BTreeSet<&str> = ["200", "401"].into_iter().collect();
+            assert_eq!(
+                statuses, expected,
+                "{method} {path} has the wrong documented statuses"
+            );
+            for status in expected {
+                assert!(
+                    responses[status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON body"
+                );
+            }
+            continue;
+        }
+
+        let (expected, success_status): (BTreeSet<&str>, &str) = match (*method, *path) {
+            ("get", "/health") | ("get", "/api/market-data/sources") => {
+                (["200"].into_iter().collect(), "200")
+            }
+            ("get", "/api/market-data/lookup") => (["200", "400"].into_iter().collect(), "200"),
+            ("post", "/api/market-data/load-range") => (
+                [
+                    "200", "400", "401", "409", "415", "422", "429", "500", "502", "503",
+                ]
                 .into_iter()
                 .collect(),
+                "200",
+            ),
+            ("post", "/api/market-data/load-range/async") => (
+                ["202", "400", "409", "429", "503"].into_iter().collect(),
+                "202",
+            ),
+            ("post", "/api/market-data/load") => (
+                ["200", "400", "401", "415", "422", "500", "502", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
+            _ => (
+                ["200", "400", "401", "415", "422", "500", "502", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
         };
         assert_eq!(
             statuses, expected,
@@ -501,14 +558,33 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
         );
 
         assert!(
-            responses["200"]["content"]["application/json"].is_object(),
+            responses[success_status]["content"]["application/json"].is_object(),
             "{method} {path} must document a JSON success body"
         );
-        for status in expected.iter().filter(|status| **status != "200") {
-            assert!(
-                responses[*status]["content"]["text/plain"].is_object(),
-                "{method} {path} {status} must document a text/plain error body"
+        for status in expected.iter().filter(|status| **status != success_status) {
+            let structured = matches!(
+                (*method, *path, *status),
+                (
+                    "post",
+                    "/api/market-data/load" | "/api/market-data/load-range",
+                    "400"
+                ) | (
+                    "post",
+                    "/api/market-data/load-range" | "/api/market-data/load-range/async",
+                    "400" | "409" | "429"
+                )
             );
+            if structured {
+                assert!(
+                    responses[*status]["content"]["application/json"].is_object(),
+                    "{method} {path} {status} must document a JSON error body"
+                );
+            } else {
+                assert!(
+                    responses[*status]["content"]["text/plain"].is_object(),
+                    "{method} {path} {status} must document a text/plain error body"
+                );
+            }
         }
     }
 
@@ -561,7 +637,7 @@ fn document_contains_the_expected_schemas_and_shapes() {
         "LoadIdentifierOutcome",
         "RunStatus",
         "IdentifierLoadReport",
-        "DateLoadSection",
+        "DateLoadSummary",
         "RangeLoadTotals",
         "IdentifierRangeLoadReport",
     ] {
@@ -605,7 +681,10 @@ fn document_contains_the_expected_schemas_and_shapes() {
         .collect();
     assert_eq!(documented_outcomes, expected_outcomes);
 
-    let expected_statuses: BTreeSet<&str> = ["complete", "partial", "failed"].into_iter().collect();
+    let expected_statuses: BTreeSet<&str> =
+        ["complete", "partial", "failed", "cancelled", "interrupted"]
+            .into_iter()
+            .collect();
     let documented_statuses: BTreeSet<&str> = schemas["RunStatus"]["enum"]
         .as_array()
         .expect("RunStatus enum")

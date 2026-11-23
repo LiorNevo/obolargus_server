@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod automation;
 pub mod config;
 pub mod docs;
@@ -40,6 +41,8 @@ pub struct AppState {
     pub automation: Arc<automation::state::AutomationState>,
     /// Morpheus agent runtime state.
     pub morpheus: Arc<morpheus::state::MorpheusState>,
+    /// Authentication settings, verifier, actor cache, and token service.
+    pub auth: Arc<auth::AuthState>,
 }
 
 impl AppState {
@@ -60,12 +63,14 @@ impl AppState {
             morpheus::state::MorpheusState::new(&config)
                 .map_err(|error| format!("morpheus state: {error}"))?,
         );
+        let auth = Arc::new(auth::AuthState::from_config(&config, pool.clone())?);
         Ok(Self {
             config,
             pool,
             market_data,
             automation,
             morpheus,
+            auth,
         })
     }
 
@@ -90,29 +95,55 @@ impl AppState {
             morpheus::state::MorpheusState::new(&config)
                 .map_err(|error| format!("morpheus state: {error}"))?,
         );
-        Ok(Self {
+        let auth = Arc::new(auth::AuthState::from_config(&config, pool.clone())?);
+        let state = Self {
             config,
             pool,
             market_data,
             automation,
             morpheus,
-        })
+            auth,
+        };
+        if let Some(pool) = state.pool.as_ref() {
+            auth::bootstrap::run(pool, &state.auth).await?;
+        }
+        Ok(state)
     }
 }
 
 /// Builds the API [`Router`] with tracing and CORS middleware and the
 /// interactive OpenAPI documentation surfaces.
 pub fn router(state: AppState) -> Router {
+    use axum::http::Method;
+    use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
     use tower_http::cors::{AllowOrigin, CorsLayer};
     use tower_http::trace::TraceLayer;
 
     let (api_router, document) = api_router().split_for_parts();
     let document = with_document_metadata(document);
+    let auth_state = state.clone();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(cors_origins(&state.config)))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT]);
 
+    // Layer order is outermost first: CORS, then default-deny authentication,
+    // then request tracing (innermost).
     api_router
         .merge(docs::swagger_routes(document))
-        .layer(CorsLayer::new().allow_origin(AllowOrigin::list(cors_origins(&state.config))))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            auth::middleware::require_auth,
+        ))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -127,6 +158,8 @@ pub fn api_router() -> utoipa_axum::router::OpenApiRouter<AppState> {
 
     OpenApiRouter::new()
         .routes(routes!(routes::health::health))
+        .routes(routes!(routes::auth::login))
+        .routes(routes!(routes::auth::refresh))
         .routes(routes!(routes::domain::get_schema))
         .routes(routes!(routes::assets::search_assets))
         .routes(routes!(routes::market_data::list_sources))
@@ -246,7 +279,34 @@ fn with_document_metadata(mut document: utoipa::openapi::OpenApi) -> utoipa::ope
     );
     document.tags = Some(vec![data_dictionary]);
 
+    add_bearer_security(&mut document);
+
     docs::with_data_dictionary(document)
+}
+
+/// Declares the application bearer scheme and makes it the global
+/// requirement; public operations opt out with `security(())`.
+fn add_bearer_security(document: &mut utoipa::openapi::OpenApi) {
+    use utoipa::openapi::RefOr;
+    use utoipa::openapi::security::{
+        HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme,
+    };
+
+    let mut components = document.components.take().unwrap_or_default();
+    components.security_schemes.insert(
+        auth::BEARER_SCHEME_NAME.to_string(),
+        RefOr::T(SecurityScheme::Http(
+            HttpBuilder::new()
+                .scheme(HttpAuthScheme::Bearer)
+                .bearer_format("JWT")
+                .build(),
+        )),
+    );
+    document.components = Some(components);
+    document.security = Some(vec![SecurityRequirement::new(
+        auth::BEARER_SCHEME_NAME,
+        Vec::<String>::new(),
+    )]);
 }
 
 fn cors_origins(config: &AppConfig) -> Vec<HeaderValue> {
@@ -329,8 +389,27 @@ pub async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error + 
             Ok(count) => tracing::warn!(count, "marked stale automation runs interrupted"),
             Err(error) => tracing::warn!(%error, "could not mark stale automation runs"),
         }
+        match obolargus_core::market_data::audit::finalize_open_child_runs(pool).await {
+            Ok(0) => {}
+            Ok(count) => tracing::warn!(count, "closed open load child runs"),
+            Err(error) => tracing::warn!(%error, "could not close open load child runs"),
+        }
+        match obolargus_core::market_data::history::finalize_open_groups(pool).await {
+            Ok(0) => {}
+            Ok(count) => tracing::warn!(count, "finalized open load groups"),
+            Err(error) => tracing::warn!(%error, "could not finalize open load groups"),
+        }
+        if let Err(error) = obolargus_core::market_data::history::sweep_stale_groups(
+            pool,
+            state.config.data_load_stale_after_seconds,
+        )
+        .await
+        {
+            tracing::warn!(%error, "could not sweep stale load groups");
+        }
     }
 
+    tasks::warn_when_scheduled_tasks_disabled(&config);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     if config.run_scheduled_tasks {
         let task_state = state.clone();
@@ -353,7 +432,11 @@ pub async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error + 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "obolargus-server listening");
 
-    let server = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
+    let server = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         // Honor an external SIGTERM / Ctrl-C by flipping the watch.
         let _ = tokio::signal::ctrl_c().await;
         let _ = shutdown_tx.send(true);

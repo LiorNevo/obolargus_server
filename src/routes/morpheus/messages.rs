@@ -1,7 +1,7 @@
 //! Message enqueue route.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -10,8 +10,9 @@ use uuid::Uuid;
 use obolargus_core::morpheus::error::MorpheusError;
 use obolargus_core::morpheus::persistence;
 
-use super::{ApiError, MessageView, TurnSummaryView, actor, require_enabled, require_pool};
+use super::{ApiError, MessageView, TurnSummaryView, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::morpheus::scheduler;
 
 /// Send-message body.
@@ -50,12 +51,13 @@ pub struct SendMessageResponse {
 )]
 pub async fn send_message(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(conversation_id): Path<Uuid>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let owner = actor(&state);
+    let owner = &auth.owner_id;
 
     let content = body.content.trim();
     if content.is_empty() {

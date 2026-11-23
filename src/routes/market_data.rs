@@ -11,19 +11,30 @@
 //!   and date, returning the execution report.
 
 #![forbid(unsafe_code)]
+// The structured error carries a details JSON value and a message; boxing it
+// would only move an error-path allocation into every handler signature.
+#![allow(clippy::result_large_err)]
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use axum::Json;
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Extension, Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use obolargus_core::domain::asset::read::get_asset;
 use obolargus_core::domain::error::DomainError;
 use obolargus_core::domain::id::{AssetId, DomainId};
-use obolargus_core::market_data::audit::LoadRunContext;
+use obolargus_core::market_data::audit::{
+    GroupRegistration, LoadRunContext, insert_load_range_group,
+};
 use obolargus_core::market_data::data_domain::DataDomain;
 use obolargus_core::market_data::error::MarketDataProviderError;
+use obolargus_core::market_data::history::finalize_group_from_dates;
 use obolargus_core::market_data::history_load::{
     HistoryLoadConfig, HistoryLoadReport, run_asset_history_load,
 };
@@ -31,8 +42,8 @@ use obolargus_core::market_data::load::{
     IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load_with_snapshot,
 };
 use obolargus_core::market_data::load_range::{
-    IdentifierRangeLoadConfig, IdentifierRangeLoadReport, run_identifier_range_load_with_group,
-    run_identifier_range_load_with_group_cancellable,
+    IdentifierRangeLoadConfig, IdentifierRangeLoadReport,
+    run_identifier_range_load_with_group_cancellable_owned,
 };
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
@@ -42,6 +53,152 @@ use obolargus_core::market_data::registry::SourceDescriptor;
 use obolargus_core::market_data::types::{TickerLookupRequest, TypedIdentifier};
 
 use crate::AppState;
+use crate::auth::AuthUser;
+
+/// Structured error envelope shared by the load endpoints.
+///
+/// Implements FR-011 / FR-012 / FR-015 of
+/// `specs/034-production-hardening/spec.md`.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct LoadErrorEnvelope {
+    /// Error details.
+    pub error: LoadErrorBody,
+}
+
+/// One structured load error.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct LoadErrorBody {
+    /// Stable machine-readable code.
+    pub code: String,
+    /// Operator-facing message naming the field and values.
+    pub message: String,
+    /// Machine-readable details (`field`, `limit`, `actual`, `group_id`).
+    pub details: Option<serde_json::Value>,
+}
+
+/// A load-request rejection.
+#[derive(Debug, Clone)]
+pub struct LoadApiError {
+    /// HTTP status.
+    pub status: StatusCode,
+    /// Stable error code.
+    pub code: &'static str,
+    /// Operator-facing message.
+    pub message: String,
+    /// Optional machine-readable details.
+    pub details: Option<serde_json::Value>,
+    /// Seconds until the caller may retry (429 only).
+    pub retry_after: Option<u64>,
+}
+
+impl LoadApiError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            details: None,
+            retry_after: None,
+        }
+    }
+
+    fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    fn validation(field: &str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "validation_error", message)
+            .with_details(serde_json::json!({ "field": field }))
+    }
+
+    fn limit(field: &str, limit: i64, actual: i64, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "limit_exceeded", message)
+            .with_details(serde_json::json!({ "field": field, "limit": limit, "actual": actual }))
+    }
+
+    fn conflict(group_id: Uuid) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "group_id_conflict",
+            "the client group id is already in use",
+        )
+        .with_details(serde_json::json!({ "group_id": group_id.to_string() }))
+    }
+
+    fn rate_limited(retry_after: u64) -> Self {
+        let mut error = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many load starts; wait before starting another run",
+        );
+        error.retry_after = Some(retry_after.max(1));
+        error
+    }
+}
+
+impl IntoResponse for LoadApiError {
+    fn into_response(self) -> Response {
+        let envelope = LoadErrorEnvelope {
+            error: LoadErrorBody {
+                code: self.code.to_string(),
+                message: self.message,
+                details: self.details,
+            },
+        };
+        let mut response = (self.status, Json(envelope)).into_response();
+        if let Some(retry_after) = self.retry_after
+            && let Ok(value) = HeaderValue::from_str(&retry_after.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
+    }
+}
+
+type LoadApiResult<T> = Result<Json<T>, LoadApiError>;
+
+/// One fixed-window load-start bucket.
+struct StartWindow {
+    started: Instant,
+    count: u32,
+}
+
+/// Process-local fixed-window load-start limiter keyed by owner.
+///
+/// Implements FR-012 of `specs/034-production-hardening/spec.md`.
+fn start_limiter() -> &'static Mutex<HashMap<String, StartWindow>> {
+    static LIMITER: OnceLock<Mutex<HashMap<String, StartWindow>>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Consumes one start token, or returns the `Retry-After` seconds.
+fn check_start_limit(owner_id: &str, limit: u32) -> Result<(), u64> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let mut buckets = start_limiter()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    buckets.retain(|_, window| now.duration_since(window.started).as_secs() < 60);
+    let window = buckets.entry(owner_id.to_string()).or_insert(StartWindow {
+        started: now,
+        count: 0,
+    });
+    let elapsed = now.duration_since(window.started).as_secs();
+    if elapsed >= 60 {
+        *window = StartWindow {
+            started: now,
+            count: 0,
+        };
+    }
+    if window.count >= limit {
+        return Err(60u64.saturating_sub(elapsed).max(1));
+    }
+    window.count += 1;
+    Ok(())
+}
 
 /// `GET /api/market-data/sources` — return every configured source.
 #[utoipa::path(
@@ -417,82 +574,137 @@ struct PreparedRangeLoad {
     source: Option<String>,
     create_missing_assets: bool,
     data_domain: DataDomain,
-    group_id: Uuid,
+    client_group_id: Uuid,
+    owner_id: String,
+    dates_requested: i32,
 }
 
-/// Validates a range request before any database work.
+/// Normalizes and de-duplicates identifiers before counting.
+///
+/// Trimming and case-folding are deterministic, so a batch that differs only
+/// by whitespace or case is counted once.
+///
+/// Implements FR-011 of `specs/034-production-hardening/spec.md`.
+fn normalize_identifiers(
+    inputs: Vec<IdentifierInput>,
+    max_identifiers: usize,
+) -> Result<Vec<TypedIdentifier>, LoadApiError> {
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let identifier = input
+            .into_identifier()
+            .map_err(|error| LoadApiError::validation("identifiers", error))?;
+        let key = (
+            identifier.scheme.to_uppercase(),
+            identifier.value.to_uppercase(),
+        );
+        if seen.insert(key) {
+            unique.push(identifier);
+        }
+    }
+    if unique.is_empty() {
+        return Err(LoadApiError::validation(
+            "identifiers",
+            "the identifier list is empty after trimming and de-duplication",
+        ));
+    }
+    if unique.len() > max_identifiers {
+        return Err(LoadApiError::limit(
+            "identifiers",
+            max_identifiers as i64,
+            unique.len() as i64,
+            format!(
+                "{} unique identifiers exceed the configured limit of {max_identifiers}",
+                unique.len()
+            ),
+        ));
+    }
+    Ok(unique)
+}
+
+/// Validates a range request before any database or provider work.
 ///
 /// Shared by the synchronous and fire-and-forget range endpoints so both
 /// surfaces reject the same inputs with the same messages.
-fn validate_range_load(body: LoadRangeBody) -> Result<PreparedRangeLoad, (StatusCode, String)> {
-    let mut identifiers = Vec::with_capacity(body.identifiers.len());
-    for input in body.identifiers {
-        identifiers.push(
-            input
-                .into_identifier()
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("validation error: {e}")))?,
-        );
-    }
-    if identifiers.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "validation error: the identifier list is empty".to_string(),
-        ));
-    }
+///
+/// Implements FR-011 / FR-012 of `specs/034-production-hardening/spec.md`.
+fn validate_range_load(
+    body: LoadRangeBody,
+    config: &crate::config::AppConfig,
+    owner_id: &str,
+) -> Result<PreparedRangeLoad, LoadApiError> {
+    let identifiers = normalize_identifiers(body.identifiers, config.data_load_max_identifiers)?;
 
     let from = chrono::NaiveDate::parse_from_str(body.from.trim(), "%Y-%m-%d").map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "validation error: '{}' is not a valid YYYY-MM-DD date",
-                body.from
-            ),
+        LoadApiError::validation(
+            "from",
+            format!("'{}' is not a valid YYYY-MM-DD date", body.from),
         )
     })?;
     let to = chrono::NaiveDate::parse_from_str(body.to.trim(), "%Y-%m-%d").map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "validation error: '{}' is not a valid YYYY-MM-DD date",
-                body.to
-            ),
+        LoadApiError::validation(
+            "to",
+            format!("'{}' is not a valid YYYY-MM-DD date", body.to),
         )
     })?;
+    if from > to {
+        return Err(LoadApiError::validation(
+            "range",
+            format!("range start {from} is later than range end {to}"),
+        ));
+    }
+    let days = (to - from).num_days() + 1;
+    if days > config.data_load_max_range_days {
+        return Err(LoadApiError::limit(
+            "range_days",
+            config.data_load_max_range_days,
+            days,
+            format!(
+                "range length {days} days exceeds the configured limit of {}",
+                config.data_load_max_range_days
+            ),
+        ));
+    }
+    let today = chrono::Utc::now().date_naive();
+    let latest = today + chrono::Duration::days(1);
+    if to > latest {
+        return Err(LoadApiError::validation(
+            "to",
+            format!("end date {to} is more than one day in the future (latest {latest})"),
+        ));
+    }
+    if body.concurrency == 0 || body.concurrency > config.data_load_max_concurrency {
+        return Err(LoadApiError::validation(
+            "concurrency",
+            format!(
+                "concurrency must be between 1 and {}, got {}",
+                config.data_load_max_concurrency, body.concurrency
+            ),
+        ));
+    }
+    let identifier_days = (identifiers.len() as i64).saturating_mul(days);
+    if identifier_days > config.data_load_max_identifier_days {
+        return Err(LoadApiError::limit(
+            "identifier_days",
+            config.data_load_max_identifier_days,
+            identifier_days,
+            format!(
+                "identifier-days {identifier_days} exceeds the configured limit of {}",
+                config.data_load_max_identifier_days
+            ),
+        ));
+    }
     let data_domain = parse_data_domain(&body.data_domain)?;
-    let group_id = match body.client_group_id.as_deref() {
+    let client_group_id = match body.client_group_id.as_deref() {
         Some(raw) => Uuid::parse_str(raw.trim()).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("validation error: '{raw}' is not a valid group id"),
+            LoadApiError::validation(
+                "client_group_id",
+                format!("'{raw}' is not a valid group id"),
             )
         })?,
         None => Uuid::new_v4(),
     };
-
-    let today = chrono::Utc::now().date_naive();
-    if from > to {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("validation error: range start {from} is later than range end {to}"),
-        ));
-    }
-    if to > today {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("validation error: as-of date {to} is later than today ({today})"),
-        ));
-    }
-    if body.concurrency == 0
-        || body.concurrency > obolargus_core::market_data::load_range::MAX_CONCURRENCY
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "validation error: concurrency must be between 1 and {}",
-                obolargus_core::market_data::load_range::MAX_CONCURRENCY
-            ),
-        ));
-    }
 
     Ok(PreparedRangeLoad {
         identifiers,
@@ -502,37 +714,54 @@ fn validate_range_load(body: LoadRangeBody) -> Result<PreparedRangeLoad, (Status
         source: body.source,
         create_missing_assets: body.create_missing_assets,
         data_domain,
-        group_id,
+        client_group_id,
+        owner_id: owner_id.to_string(),
+        dates_requested: days as i32,
     })
 }
 
-/// Rejects a group id that already names a run or range group.
-async fn ensure_group_id_available(
+/// Registers the durable range group and maps a duplicate to a 409.
+///
+/// Implements FR-015 of `specs/034-production-hardening/spec.md`.
+async fn register_range_group(
     pool: &sqlx::PgPool,
-    group_id: Uuid,
-) -> Result<(), (StatusCode, String)> {
-    let conflict: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM reference_data_load_runs
-            WHERE id = $1 OR range_group_id = $1
-         )",
+    prepared: &PreparedRangeLoad,
+) -> Result<Uuid, LoadApiError> {
+    match insert_load_range_group(
+        pool,
+        &prepared.owner_id,
+        prepared.client_group_id,
+        prepared.from,
+        prepared.to,
+        prepared.concurrency as i32,
+        prepared.dates_requested,
     )
-    .bind(group_id)
-    .fetch_one(pool)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("group id check failed: {e}"),
-        )
-    })?;
-    if conflict {
-        return Err((
-            StatusCode::CONFLICT,
-            "group_id_conflict: the client group id is already in use".to_string(),
-        ));
+    .map_err(internal_error)?
+    {
+        GroupRegistration::Inserted(group) => Ok(group.id),
+        GroupRegistration::Conflict(existing) => Err(LoadApiError::conflict(existing)),
     }
-    Ok(())
+}
+
+fn internal_error(error: MarketDataProviderError) -> LoadApiError {
+    tracing::error!(%error, "load request failed");
+    let status = match &error {
+        MarketDataProviderError::NotFound(_) => StatusCode::NOT_FOUND,
+        other => typed_error_to_http(other).0,
+    };
+    LoadApiError::new(status, "storage_failure", error.to_string())
+}
+
+/// Finalizes a registered group from its persisted dates.
+///
+/// Called on every exit path of the sync and background runners.
+///
+/// Implements FR-015 / FR-019 of `specs/034-production-hardening/spec.md`.
+async fn finalize_registered_group(pool: &sqlx::PgPool, group_id: Uuid) {
+    if let Err(error) = finalize_group_from_dates(pool, group_id).await {
+        tracing::error!(%group_id, %error, "could not finalize range group");
+    }
 }
 
 /// Response of the fire-and-forget range endpoint.
@@ -545,19 +774,16 @@ pub struct RangeLoadAccepted {
 }
 
 /// Parses and validates the optional data domain.
-fn parse_data_domain(value: &Option<String>) -> Result<DataDomain, (StatusCode, String)> {
+fn parse_data_domain(value: &Option<String>) -> Result<DataDomain, LoadApiError> {
     let raw = value.as_deref().unwrap_or("market_data");
-    let domain = raw.parse::<DataDomain>().map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("validation error: {error}"),
-        )
-    })?;
+    let domain = raw
+        .parse::<DataDomain>()
+        .map_err(|error| LoadApiError::validation("data_domain", error))?;
     if !domain.is_loadable() {
-        return Err((
-            StatusCode::BAD_REQUEST,
+        return Err(LoadApiError::validation(
+            "data_domain",
             format!(
-                "validation error: domain '{raw}' is not loadable: {}",
+                "domain '{raw}' is not loadable: {}",
                 domain.unavailable_reason().unwrap_or("not available")
             ),
         ));
@@ -583,7 +809,7 @@ fn parse_data_domain(value: &Option<String>) -> Result<DataDomain, (StatusCode, 
     request_body = LoadBody,
     responses(
         (status = 200, description = "The batch execution report (per-identifier failures are reported here)", body = IdentifierLoadReport),
-        (status = 400, description = "Invalid identifier, date or empty identifier list", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid identifier, date or empty identifier list", body = LoadErrorEnvelope),
         (status = 401, description = "The provider rejected the credentials", body = String, content_type = "text/plain"),
         (status = 415, description = "Missing or unsupported JSON content type", body = String, content_type = "text/plain"),
         (status = 422, description = "The JSON body does not match the required shape", body = String, content_type = "text/plain"),
@@ -594,50 +820,36 @@ fn parse_data_domain(value: &Option<String>) -> Result<DataDomain, (StatusCode, 
 )]
 pub async fn load(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Json(body): Json<LoadBody>,
-) -> Result<Json<IdentifierLoadReport>, (StatusCode, String)> {
-    let mut identifiers = Vec::with_capacity(body.identifiers.len());
-    for input in body.identifiers {
-        identifiers.push(
-            input
-                .into_identifier()
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("validation error: {e}")))?,
-        );
-    }
-    if identifiers.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "validation error: the identifier list is empty".to_string(),
-        ));
-    }
+) -> LoadApiResult<IdentifierLoadReport> {
+    let identifiers =
+        normalize_identifiers(body.identifiers, state.config.data_load_max_identifiers)?;
 
     let as_of_date =
         chrono::NaiveDate::parse_from_str(body.date.trim(), "%Y-%m-%d").map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "validation error: '{}' is not a valid YYYY-MM-DD date",
-                    body.date
-                ),
+            LoadApiError::validation(
+                "date",
+                format!("'{}' is not a valid YYYY-MM-DD date", body.date),
             )
         })?;
     let data_domain = parse_data_domain(&body.data_domain)?;
 
     // A date in the future is caller-input validation, checked before the
-    // pool so the answer does not depend on whether a database is
-    // configured.
+    // pool so the answer does not depend on whether a database is configured.
     let today = chrono::Utc::now().date_naive();
     if as_of_date > today {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("validation error: as-of date {as_of_date} is later than today ({today})"),
+        return Err(LoadApiError::validation(
+            "date",
+            format!("as-of date {as_of_date} is later than today ({today})"),
         ));
     }
 
     let pool = state.pool.as_ref().ok_or_else(|| {
-        (
+        LoadApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no database pool configured".to_string(),
+            "database_unavailable",
+            "no database pool configured",
         )
     })?;
 
@@ -661,10 +873,11 @@ pub async fn load(
             range_from: None,
             range_to: None,
             range_concurrency: None,
+            owner_id: auth.owner_id,
         },
     )
     .await
-    .map_err(|e| typed_error_to_http(&e))?;
+    .map_err(internal_error)?;
 
     Ok(Json(report))
 }
@@ -681,8 +894,10 @@ pub async fn load(
     description = "Fans the single-date load out over every calendar day in from..=to with a bounded concurrency window. Per-identifier and per-date failures are reported in the 200 range report; only caller-input validation and infrastructure failures produce non-200 statuses.",
     request_body = LoadRangeBody,
     responses(
-        (status = 200, description = "The range execution report (per-identifier failures are reported here)", body = IdentifierRangeLoadReport),
-        (status = 400, description = "Invalid identifier, date, range or concurrency", body = String, content_type = "text/plain"),
+        (status = 200, description = "The range execution report (per-date summaries and aggregate counters)", body = IdentifierRangeLoadReport),
+        (status = 400, description = "Invalid identifier, date, range, concurrency, or limit", body = LoadErrorEnvelope),
+        (status = 409, description = "The client group id is already in use", body = LoadErrorEnvelope),
+        (status = 429, description = "Too many load starts", body = LoadErrorEnvelope),
         (status = 401, description = "The provider rejected the credentials", body = String, content_type = "text/plain"),
         (status = 415, description = "Missing or unsupported JSON content type", body = String, content_type = "text/plain"),
         (status = 422, description = "The JSON body does not match the required shape", body = String, content_type = "text/plain"),
@@ -693,18 +908,33 @@ pub async fn load(
 )]
 pub async fn load_range(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Json(body): Json<LoadRangeBody>,
-) -> Result<Json<IdentifierRangeLoadReport>, (StatusCode, String)> {
-    let prepared = validate_range_load(body)?;
+) -> LoadApiResult<IdentifierRangeLoadReport> {
+    let prepared = validate_range_load(body, &state.config, &auth.owner_id)?;
+    check_start_limit(&auth.owner_id, state.config.data_load_starts_per_minute)
+        .map_err(LoadApiError::rate_limited)?;
     let pool = state.pool.as_ref().ok_or_else(|| {
-        (
+        LoadApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no database pool configured".to_string(),
+            "database_unavailable",
+            "no database pool configured",
         )
     })?;
-    ensure_group_id_available(pool, prepared.group_id).await?;
+    let group_id = register_range_group(pool, &prepared).await?;
+    let cancel = match crate::routes::load_cancellation::register(group_id) {
+        Ok(cancel) => cancel,
+        Err(()) => {
+            finalize_registered_group(pool, group_id).await;
+            return Err(LoadApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_failure",
+                "cancellation registry unavailable",
+            ));
+        }
+    };
 
-    let report = run_identifier_range_load_with_group(
+    let report = run_identifier_range_load_with_group_cancellable_owned(
         Some(pool),
         &state.market_data,
         IdentifierRangeLoadConfig {
@@ -718,12 +948,19 @@ pub async fn load_range(
             create_missing_assets: prepared.create_missing_assets,
             default_currency: obolargus_core::market_data::load::DEFAULT_ASSET_CURRENCY.to_string(),
         },
-        prepared.group_id,
+        group_id,
         prepared.data_domain,
+        Some(cancel),
+        &prepared.owner_id,
     )
-    .await
-    .map_err(|e| typed_error_to_http(&e))?;
+    .await;
 
+    // Every exit path finalizes the registered group and clears the
+    // in-process cancellation handle.
+    crate::routes::load_cancellation::finish(group_id);
+    finalize_registered_group(pool, group_id).await;
+
+    let report = report.map_err(internal_error)?;
     Ok(Json(report))
 }
 
@@ -742,35 +979,44 @@ pub async fn load_range(
     request_body = LoadRangeBody,
     responses(
         (status = 202, description = "The range load was accepted", body = RangeLoadAccepted),
-        (status = 400, description = "Invalid identifier, date, range or concurrency", body = String, content_type = "text/plain"),
-        (status = 409, description = "The client group id is already in use", body = String, content_type = "text/plain"),
-        (status = 503, description = "No database pool is configured", body = String, content_type = "text/plain")
+        (status = 400, description = "Invalid identifier, date, range, concurrency, or limit", body = LoadErrorEnvelope),
+        (status = 409, description = "The client group id is already in use", body = LoadErrorEnvelope),
+        (status = 429, description = "Too many load starts", body = LoadErrorEnvelope),
+        (status = 503, description = "No database pool is configured", body = LoadErrorEnvelope)
     )
 )]
 pub async fn start_load_range(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Json(body): Json<LoadRangeBody>,
-) -> Result<(StatusCode, Json<RangeLoadAccepted>), (StatusCode, String)> {
-    let prepared = validate_range_load(body)?;
+) -> Result<(StatusCode, Json<RangeLoadAccepted>), LoadApiError> {
+    let prepared = validate_range_load(body, &state.config, &auth.owner_id)?;
+    check_start_limit(&auth.owner_id, state.config.data_load_starts_per_minute)
+        .map_err(LoadApiError::rate_limited)?;
     let pool = state.pool.as_ref().ok_or_else(|| {
-        (
+        LoadApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no database pool configured".to_string(),
+            "database_unavailable",
+            "no database pool configured",
         )
     })?;
-    ensure_group_id_available(pool, prepared.group_id).await?;
-    let group_id = prepared.group_id;
-    let cancel = crate::routes::load_cancellation::register(group_id).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cancellation registry unavailable".to_string(),
-        )
-    })?;
+    let group_id = register_range_group(pool, &prepared).await?;
+    let cancel = match crate::routes::load_cancellation::register(group_id) {
+        Ok(cancel) => cancel,
+        Err(()) => {
+            finalize_registered_group(pool, group_id).await;
+            return Err(LoadApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_failure",
+                "cancellation registry unavailable",
+            ));
+        }
+    };
     let background_pool = pool.clone();
     let registry = state.market_data.clone();
 
     tokio::spawn(async move {
-        let result = run_identifier_range_load_with_group_cancellable(
+        let result = run_identifier_range_load_with_group_cancellable_owned(
             Some(&background_pool),
             &registry,
             IdentifierRangeLoadConfig {
@@ -788,9 +1034,14 @@ pub async fn start_load_range(
             group_id,
             prepared.data_domain,
             Some(cancel),
+            &prepared.owner_id,
         )
         .await;
+
+        // Every exit path, including an early infrastructure error, leaves a
+        // terminal group and clears the in-process stop handle.
         crate::routes::load_cancellation::finish(group_id);
+        finalize_registered_group(&background_pool, group_id).await;
         if let Err(error) = result {
             tracing::error!(%group_id, %error, "background range load failed");
         }
@@ -844,6 +1095,7 @@ pub struct HistoryLoadBody {
 )]
 pub async fn history_load(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Json(body): Json<HistoryLoadBody>,
 ) -> Result<Json<HistoryLoadReport>, (StatusCode, String)> {
     let from = chrono::NaiveDate::parse_from_str(body.from.trim(), "%Y-%m-%d").map_err(|_| {
@@ -915,6 +1167,7 @@ pub async fn history_load(
             to,
             preferred_source: body.source,
             trigger: "chart".to_string(),
+            owner_id: auth.owner_id,
         },
     )
     .await

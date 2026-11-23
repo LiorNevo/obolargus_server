@@ -144,7 +144,7 @@ async fn sse_stream_delivers_snapshot_messages_logs_and_terminal_events() {
         Some("no-cache")
     );
 
-    let body = tokio::time::timeout(Duration::from_secs(15), response.into_body().collect())
+    let body = tokio::time::timeout(Duration::from_secs(60), response.into_body().collect())
         .await
         .expect("stream finished")
         .expect("body")

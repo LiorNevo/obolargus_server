@@ -71,6 +71,9 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
         .pool
         .as_ref()
         .ok_or_else(|| AutomationError::Infrastructure("database unavailable".to_string()))?;
+    let owner_id = persistence::flow_owner_id(pool, trigger.flow_id)
+        .await?
+        .ok_or_else(|| AutomationError::NotFound(format!("flow {}", trigger.flow_id)))?;
     let now = Utc::now();
     let (Some(kind), Some(next_at)) = (trigger.repeat_kind.as_deref(), trigger.next_occurrence_at)
     else {
@@ -92,6 +95,7 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
         persistence::advance_trigger(pool, trigger.id, now, next).await?;
         audit::record_best_effort(
             state,
+            &owner_id,
             "trigger.missed_skip",
             "trigger",
             trigger.id,
@@ -119,6 +123,7 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
         persistence::advance_trigger(pool, trigger.id, now, next).await?;
         audit::record_best_effort(
             state,
+            &owner_id,
             "trigger.queue_rejected",
             "trigger",
             trigger.id,
@@ -143,6 +148,7 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
         persistence::advance_trigger(pool, trigger.id, now, next).await?;
         audit::record_best_effort(
             state,
+            &owner_id,
             "trigger.overlap_skip",
             "trigger",
             trigger.id,
@@ -155,11 +161,12 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
     }
     if cancel_previous_on_overlap(&trigger.overlap_policy, active.len()) {
         for run_id in &active {
-            let _ = persistence::request_cancel(pool, *run_id).await;
+            let _ = persistence::request_cancel_for_owner(pool, &owner_id, *run_id).await;
             state.automation.cancel(*run_id);
         }
         audit::record_best_effort(
             state,
+            &owner_id,
             "trigger.overlap_cancel_previous",
             "trigger",
             trigger.id,
@@ -181,14 +188,15 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
         now,
     )?
     .unwrap_or(now);
-    let run = persistence::insert_run(
+    let run = persistence::insert_run_for_owner(
         pool,
+        &owner_id,
         trigger.flow_id,
         version_id,
         Some(trigger.id),
         "schedule",
         trigger.node_id.as_deref(),
-        Some(&state.config.automation_actor_id),
+        Some(&owner_id),
         &json!({}),
         None,
         None,
@@ -197,6 +205,7 @@ async fn fire(state: &AppState, trigger: &TriggerRecord) -> Result<(), Automatio
     persistence::advance_trigger(pool, trigger.id, now, next).await?;
     audit::record_best_effort(
         state,
+        &owner_id,
         "trigger.fire",
         "trigger",
         trigger.id,
@@ -246,6 +255,7 @@ mod tests {
             .run(&pool)
             .await
             .ok()?;
+        obolargus_core::common::cleanup(&pool).await;
         Some(pool)
     }
 
@@ -431,8 +441,9 @@ mod tests {
         let trigger = persistence::update_trigger(&pool, trigger.id, None, Some("skip"), None)
             .await
             .expect("skip policy");
-        let active = persistence::insert_run(
+        let active = persistence::insert_run_for_owner(
             &pool,
+            &owner,
             flow_id,
             version_id,
             Some(trigger.id),

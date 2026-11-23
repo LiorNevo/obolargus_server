@@ -1,7 +1,7 @@
 //! Approval decisions and standing grants.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,8 +13,9 @@ use obolargus_core::morpheus::error::MorpheusError;
 use obolargus_core::morpheus::model::{ToolCallStatus, TurnStatus};
 use obolargus_core::morpheus::persistence;
 
-use super::{ApiError, ApiResult, ApprovalView, actor, require_enabled, require_pool};
+use super::{ApiError, ApiResult, ApprovalView, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::morpheus::engine;
 
 /// Decision body.
@@ -72,12 +73,13 @@ pub struct DecisionResponse {
 )]
 pub async fn decide(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(approval_id): Path<Uuid>,
     Json(body): Json<DecisionRequest>,
 ) -> ApiResult<DecisionResponse> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let owner = actor(&state);
+    let owner = &auth.owner_id;
     let decision = ApprovalDecision::parse(&body.decision)
         .ok_or_else(|| MorpheusError::validation("Unknown decision."))?;
     if matches!(
@@ -193,10 +195,13 @@ async fn resume_if_ready(state: &AppState, turn_id: Uuid) -> Result<(), Morpheus
     responses((status = 200, body = StandingResponse), (status = 503, body = super::ErrorEnvelope)),
     tag = "morpheus"
 )]
-pub async fn list_standing(State(state): State<AppState>) -> ApiResult<StandingResponse> {
+pub async fn list_standing(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+) -> ApiResult<StandingResponse> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let owner = actor(&state);
+    let owner = &auth.owner_id;
     let active = persistence::get_active_standing(&pool, owner).await?;
     let history = persistence::list_standing_history(&pool, owner).await?;
     Ok(Json(StandingResponse {
@@ -215,11 +220,12 @@ pub async fn list_standing(State(state): State<AppState>) -> ApiResult<StandingR
 )]
 pub async fn revoke_standing(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(approval_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::revoke_standing(&pool, actor(&state), approval_id).await?;
+    persistence::revoke_standing(&pool, &auth.owner_id, approval_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

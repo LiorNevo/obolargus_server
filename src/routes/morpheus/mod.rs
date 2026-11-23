@@ -120,11 +120,6 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The acting user identifier.
-pub fn actor(state: &AppState) -> &str {
-    &state.config.morpheus_actor_id
-}
-
 /// Rejects requests when the feature is disabled.
 pub fn require_enabled(state: &AppState) -> Result<(), ApiError> {
     if state.config.morpheus_enabled {

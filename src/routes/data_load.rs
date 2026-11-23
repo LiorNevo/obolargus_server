@@ -6,16 +6,17 @@
 #![forbid(unsafe_code)]
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use obolargus_core::market_data::audit::get_load_range_group;
 use obolargus_core::market_data::data_domain::DataDomain;
 use obolargus_core::market_data::error::MarketDataProviderError;
 use obolargus_core::market_data::history::{
-    HistoryFilter, LoadHistoryDetail, LoadHistoryPage, RangeProgress, get_history_detail,
-    list_history, range_progress,
+    HistoryFilter, LoadHistoryDetail, LoadHistoryPage, RangeProgress, get_history_detail_for_owner,
+    list_history, range_progress_for_owner, sweep_stale_groups,
 };
 use obolargus_core::market_data::identifier_search::{
     IdentifierSearchError, IdentifierSearchRequest, IdentifierSearchResult, search_identifiers,
@@ -24,6 +25,7 @@ use obolargus_core::market_data::registry::SourceCatalogEntry;
 use obolargus_core::market_data::source_state::{SourceStateChangeResult, set_source_enabled};
 
 use crate::AppState;
+use crate::auth::AuthUser;
 
 /// JSON error envelope for the `/api/data-load/*` surface.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
@@ -347,17 +349,21 @@ pub struct HistoryQuery {
 )]
 pub async fn list_history_handler(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult<LoadHistoryPage> {
     let pool = require_pool(&state)?;
-    let filter = build_filter(query)?;
+    let filter = build_filter(query, &auth.owner_id)?;
     let page = list_history(pool, &filter, state.config.data_load_stale_after_seconds)
         .await
         .map_err(map_error)?;
     Ok(Json(page))
 }
 
-fn build_filter(query: HistoryQuery) -> Result<HistoryFilter, (StatusCode, Json<ApiErrorBody>)> {
+fn build_filter(
+    query: HistoryQuery,
+    owner_id: &str,
+) -> Result<HistoryFilter, (StatusCode, Json<ApiErrorBody>)> {
     let parse_date = |value: Option<String>,
                       name: &str|
      -> Result<Option<chrono::NaiveDate>, (StatusCode, Json<ApiErrorBody>)> {
@@ -399,6 +405,8 @@ fn build_filter(query: HistoryQuery) -> Result<HistoryFilter, (StatusCode, Json<
             "complete"
                 | "partial"
                 | "failed"
+                | "cancelled"
+                | "interrupted"
                 | "running"
                 | "incomplete"
                 | "source_enabled"
@@ -438,6 +446,7 @@ fn build_filter(query: HistoryQuery) -> Result<HistoryFilter, (StatusCode, Json<
         source: query.source,
         status: query.status,
         entry_type: query.entry_type,
+        owner_id: Some(owner_id.to_string()),
         limit: i64::from(limit),
         offset: i64::from(query.offset.unwrap_or(0)),
     })
@@ -459,12 +468,18 @@ fn build_filter(query: HistoryQuery) -> Result<HistoryFilter, (StatusCode, Json<
 )]
 pub async fn get_history_handler(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(entry_id): Path<Uuid>,
 ) -> ApiResult<LoadHistoryDetail> {
     let pool = require_pool(&state)?;
-    let detail = get_history_detail(pool, entry_id, state.config.data_load_stale_after_seconds)
-        .await
-        .map_err(map_error)?;
+    let detail = get_history_detail_for_owner(
+        pool,
+        entry_id,
+        state.config.data_load_stale_after_seconds,
+        Some(&auth.owner_id),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(detail))
 }
 
@@ -483,21 +498,96 @@ pub async fn get_history_handler(
 )]
 pub async fn get_progress_handler(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(group_id): Path<Uuid>,
 ) -> ApiResult<RangeProgress> {
     let pool = require_pool(&state)?;
-    let progress = range_progress(pool, group_id).await.map_err(map_error)?;
+    let progress = range_progress_for_owner(
+        pool,
+        group_id,
+        Some(&auth.owner_id),
+        state.config.data_load_stale_after_seconds,
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(progress))
 }
 
 /// Result of a stop request.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct StopRangeResult {
-    /// Whether a live background task was found and asked to stop.
+    /// Whether this request durably recorded an accepted stop.
     ///
-    /// `false` means the group is not running in this server process (for
-    /// example after a restart); the UI treats that as a dismissible orphan.
+    /// `false` for an unknown, terminal, stale, or other-owner group; those
+    /// cases change nothing and reveal no existence information.
     pub stopped: bool,
+}
+
+/// Records an accepted stop before the response is sent.
+///
+/// The network registry is only a fast-path signal; the durable
+/// `cancel_requested_at` marker is what survives a restart.
+///
+/// Implements FR-018 / FR-020 of `specs/034-production-hardening/spec.md`.
+async fn mark_group_stopped(
+    pool: &sqlx::PgPool,
+    group_id: Uuid,
+    owner_id: &str,
+    stale_after_seconds: i64,
+) -> Result<bool, (StatusCode, Json<ApiErrorBody>)> {
+    let group = match get_load_range_group(pool, group_id).await {
+        Ok(group) => group,
+        Err(MarketDataProviderError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(map_error(error)),
+    };
+    if group.owner_id != owner_id || group.status != "running" || group.ended_at.is_some() {
+        return Ok(false);
+    }
+    if group.started_at < chrono::Utc::now() - chrono::Duration::seconds(stale_after_seconds.max(0))
+    {
+        // A dead in-process run is finalized by the stale sweep, not stopped.
+        sweep_stale_groups(pool, stale_after_seconds)
+            .await
+            .map_err(map_error)?;
+        return Ok(false);
+    }
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reference_data_load_runs \
+         WHERE range_group_id = $1 AND ended_at IS NOT NULL",
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_failure",
+            format!("stop lookup failed: {error}"),
+        )
+    })?;
+    if completed >= i64::from(group.dates_requested) {
+        // Every requested date already persisted: a late stop must not
+        // relabel the run `cancelled`.
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE load_range_groups
+         SET cancel_requested_at = NOW()
+         WHERE id = $1 AND owner_id = $2 AND status = 'running'
+           AND cancel_requested_at IS NULL",
+    )
+    .bind(group_id)
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_failure",
+            format!("stop write failed: {error}"),
+        )
+    })?;
+    Ok(updated.rows_affected() == 1)
 }
 
 /// `POST /api/data-load/history/groups/{group_id}/stop`
@@ -506,14 +596,31 @@ pub struct StopRangeResult {
     path = "/api/data-load/history/groups/{group_id}/stop",
     tag = "data-load",
     summary = "Stop a running range load",
-    description = "Requests cooperative cancellation of a live background range load. In-flight dates are allowed to finish; no new dates start. Returns stopped=false when the group is not active in this process.",
+    description = "Durably records a stop marker, then requests cooperative cancellation of the live task. In-flight dates are allowed to finish; no new dates start. Returns stopped=false for unknown, terminal, stale, or other-owner groups without changing anything.",
     responses(
         (status = 200, description = "The stop request outcome", body = StopRangeResult),
-        (status = 400, description = "Invalid group id", body = ApiErrorBody)
+        (status = 400, description = "Invalid group id", body = ApiErrorBody),
+        (status = 503, description = "No database pool", body = ApiErrorBody)
     )
 )]
-pub async fn stop_range_handler(Path(group_id): Path<Uuid>) -> ApiResult<StopRangeResult> {
-    let stopped = crate::routes::load_cancellation::cancel(group_id);
+pub async fn stop_range_handler(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Path(group_id): Path<Uuid>,
+) -> ApiResult<StopRangeResult> {
+    let pool = require_pool(&state)?;
+    let stopped = mark_group_stopped(
+        pool,
+        group_id,
+        &auth.owner_id,
+        state.config.data_load_stale_after_seconds,
+    )
+    .await?;
+    if stopped {
+        // Fast path only: a missing registry entry still leaves the durable
+        // marker that the task or the restart sweep honors.
+        let _ = crate::routes::load_cancellation::cancel(group_id);
+    }
     Ok(Json(StopRangeResult { stopped }))
 }
 

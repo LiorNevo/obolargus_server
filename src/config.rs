@@ -39,13 +39,24 @@ pub struct AppConfig {
     /// Comma-separated CORS allowed origins for the UI.
     #[envconfig(from = "CORS_ALLOWED_ORIGINS", default = "http://127.0.0.1:8081")]
     pub cors_allowed_origins: String,
-    /// Enables JWT auth middleware. Requires a non-empty `JWT_SECRET`.
-    #[envconfig(from = "AUTH_ENABLED", default = "false")]
+    /// Enables Google/JWT auth middleware. Requires the Google client id,
+    /// allowlist, primary owner, and `JWT_SECRET`.
+    #[envconfig(from = "AUTH_ENABLED", default = "true")]
     pub auth_enabled: bool,
-    /// Whether to spawn the scheduled-task loop on `serve()`. Off by
-    /// default so tests / CI can boot without scheduled work
-    /// (FR-030 + spec 017 US4).
-    #[envconfig(from = "RUN_SCHEDULED_TASKS", default = "false")]
+    /// Google OAuth web client id used for the ID-token audience check.
+    #[envconfig(from = "GOOGLE_CLIENT_ID", default = "")]
+    pub google_client_id: String,
+    /// Comma-separated allowlist of 2–5 verified Google email addresses.
+    #[envconfig(from = "GOOGLE_ALLOWED_EMAILS", default = "")]
+    pub google_allowed_emails: String,
+    /// Email of the primary actor that owns legacy data and scheduled jobs.
+    #[envconfig(from = "PRIMARY_OWNER_EMAIL", default = "")]
+    pub primary_owner_email: String,
+    /// Explicit override allowing unauthenticated access on a non-loopback bind.
+    #[envconfig(from = "ALLOW_UNAUTHENTICATED", default = "false")]
+    pub allow_unauthenticated: bool,
+    /// Whether to spawn the scheduled-task loop on `serve()`.
+    #[envconfig(from = "RUN_SCHEDULED_TASKS", default = "true")]
     pub run_scheduled_tasks: bool,
     /// End-of-day refresh interval in seconds. Default 86400 (24 h).
     /// Implements FR-030 of spec 017.
@@ -60,6 +71,15 @@ pub struct AppConfig {
     /// in v1.
     #[envconfig(from = "MARKET_DATA_REFRESH_BATCH_SIZE", default = "50")]
     pub market_data_refresh_batch_size: u64,
+    /// Global and per-provider concurrent call limit.
+    #[envconfig(from = "MARKET_DATA_PROVIDER_MAX_CONCURRENCY", default = "4")]
+    pub market_data_provider_max_concurrency: u32,
+    /// Maximum provider attempts per identifier/date.
+    #[envconfig(from = "MARKET_DATA_PROVIDER_MAX_RETRIES", default = "3")]
+    pub market_data_provider_max_retries: u32,
+    /// Exponential backoff cap in seconds.
+    #[envconfig(from = "MARKET_DATA_PROVIDER_MAX_BACKOFF_SECONDS", default = "30")]
+    pub market_data_provider_max_backoff_seconds: u64,
     /// JSON array of per-source configs. Default = single Yahoo source.
     /// Implements FR-002 of spec 017.
     #[envconfig(from = "MARKET_DATA_SOURCES", default = "[]")]
@@ -90,12 +110,6 @@ pub struct AppConfig {
     /// Partitions created ahead of now.
     #[envconfig(from = "OBO_TEMPORAL_PARTITION_AHEAD_MONTHS", default = "2")]
     pub temporal_partition_ahead_months: u32,
-    /// Default full-resolution retention window, in days.
-    #[envconfig(from = "OBO_TEMPORAL_RETENTION_INTRADAY_DAYS", default = "90")]
-    pub temporal_retention_intraday_days: u32,
-    /// Default archive threshold, in days.
-    #[envconfig(from = "OBO_TEMPORAL_RETENTION_ARCHIVE_DAYS", default = "365")]
-    pub temporal_retention_archive_days: u32,
     /// `priority` | `named` | `first_non_empty`.
     #[envconfig(from = "OBO_TEMPORAL_PRICE_SOURCE_POLICY", default = "priority")]
     pub temporal_price_source_policy: String,
@@ -104,6 +118,24 @@ pub struct AppConfig {
     /// A running history entry older than this is labelled incomplete.
     #[envconfig(from = "DATA_LOAD_STALE_AFTER_SECONDS", default = "7200")]
     pub data_load_stale_after_seconds: i64,
+    /// Maximum identifiers in one range request.
+    #[envconfig(from = "DATA_LOAD_MAX_IDENTIFIERS", default = "500")]
+    pub data_load_max_identifiers: usize,
+    /// Maximum inclusive days in one range request.
+    #[envconfig(from = "DATA_LOAD_MAX_RANGE_DAYS", default = "1826")]
+    pub data_load_max_range_days: i64,
+    /// Maximum unique identifiers × days in one request.
+    #[envconfig(from = "DATA_LOAD_MAX_IDENTIFIER_DAYS", default = "100000")]
+    pub data_load_max_identifier_days: i64,
+    /// Maximum range concurrency.
+    #[envconfig(from = "DATA_LOAD_MAX_CONCURRENCY", default = "32")]
+    pub data_load_max_concurrency: usize,
+    /// New range starts allowed per actor per minute.
+    #[envconfig(from = "DATA_LOAD_STARTS_PER_MINUTE", default = "10")]
+    pub data_load_starts_per_minute: u32,
+    /// Retention/partition maintenance cadence.
+    #[envconfig(from = "MAINTENANCE_INTERVAL_SECONDS", default = "86400")]
+    pub maintenance_interval_seconds: u64,
 
     // ---- Automation flow engine (spec 030) ----
     /// Enables automation routes and background loops.
@@ -180,6 +212,9 @@ pub struct AppConfig {
     /// Enables Morpheus routes, engine, and UI entry point.
     #[envconfig(from = "MORPHEUS_ENABLED", default = "false")]
     pub morpheus_enabled: bool,
+    /// Conversation/message retention in days.
+    #[envconfig(from = "MORPHEUS_CONVERSATION_RETENTION_DAYS", default = "365")]
+    pub morpheus_conversation_retention_days: u32,
     /// OmniRoute OpenAI-compatible base URL.
     #[envconfig(from = "OMNIROUTE_BASE_URL", default = "http://omniroute:20128/v1")]
     pub omniroute_base_url: String,
@@ -338,10 +373,17 @@ impl Default for AppConfig {
             jwt_refresh_ttl_days: 7,
             cors_allowed_origins: "http://127.0.0.1:8081".to_string(),
             auth_enabled: false,
+            google_client_id: String::new(),
+            google_allowed_emails: String::new(),
+            primary_owner_email: String::new(),
+            allow_unauthenticated: false,
             run_scheduled_tasks: false,
             market_data_eod_interval_seconds: 86_400,
             market_data_reconcile_deferred: true,
             market_data_refresh_batch_size: 50,
+            market_data_provider_max_concurrency: 4,
+            market_data_provider_max_retries: 3,
+            market_data_provider_max_backoff_seconds: 30,
             market_data_sources: "[]".to_string(),
             yahoo_finance_api_key: String::new(),
             yahoo_finance_user_agent: String::new(),
@@ -351,10 +393,14 @@ impl Default for AppConfig {
             temporal_ingest_concurrency: 4,
             temporal_ingest_max_queue: 10_000,
             temporal_partition_ahead_months: 2,
-            temporal_retention_intraday_days: 90,
-            temporal_retention_archive_days: 365,
             temporal_price_source_policy: "priority".to_string(),
             data_load_stale_after_seconds: 7_200,
+            data_load_max_identifiers: 500,
+            data_load_max_range_days: 1_826,
+            data_load_max_identifier_days: 100_000,
+            data_load_max_concurrency: 32,
+            data_load_starts_per_minute: 10,
+            maintenance_interval_seconds: 86_400,
             automation_enabled: true,
             automation_actor_id: "dev-user".to_string(),
             automation_run_retention_days: 90,
@@ -379,6 +425,7 @@ impl Default for AppConfig {
             automation_debug_buffer_size: 1_000,
             automation_api_trigger_rate_limit_per_minute: 60,
             morpheus_enabled: false,
+            morpheus_conversation_retention_days: 365,
             omniroute_base_url: "http://omniroute:20128/v1".to_string(),
             omniroute_api_key: String::new(),
             morpheus_provider_label: "OmniRoute".to_string(),
@@ -473,6 +520,9 @@ impl AppConfig {
             eod_interval_seconds: self.market_data_eod_interval_seconds,
             refresh_batch_size: self.market_data_refresh_batch_size,
             reconcile_deferred: self.market_data_reconcile_deferred,
+            provider_max_concurrency: self.market_data_provider_max_concurrency,
+            provider_max_retries: self.market_data_provider_max_retries,
+            provider_max_backoff_seconds: self.market_data_provider_max_backoff_seconds,
             run_scheduled_tasks: self.run_scheduled_tasks,
         };
         config
@@ -483,8 +533,115 @@ impl AppConfig {
 
     /// Validates cross-field configuration rules.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.auth_enabled && self.jwt_secret.trim().is_empty() {
-            return Err(ConfigError::MissingJwtSecret);
+        if self.auth_enabled {
+            if self.jwt_secret.trim().is_empty() {
+                return Err(ConfigError::MissingJwtSecret);
+            }
+            if self.google_client_id.trim().is_empty() {
+                return Err(ConfigError::Load(
+                    "GOOGLE_CLIENT_ID must be set when AUTH_ENABLED=true".to_string(),
+                ));
+            }
+            let emails = self.google_allowlist();
+            if !(2..=5).contains(&emails.len()) {
+                return Err(ConfigError::Load(format!(
+                    "GOOGLE_ALLOWED_EMAILS must contain 2–5 addresses (got {})",
+                    emails.len()
+                )));
+            }
+            if emails.iter().any(|email| !is_valid_email(email)) {
+                return Err(ConfigError::Load(
+                    "GOOGLE_ALLOWED_EMAILS contains an invalid email address".to_string(),
+                ));
+            }
+            let primary = self.primary_owner_email.trim().to_lowercase();
+            if primary.is_empty() {
+                return Err(ConfigError::Load(
+                    "PRIMARY_OWNER_EMAIL must be set when AUTH_ENABLED=true".to_string(),
+                ));
+            }
+            if !emails.iter().any(|email| email == &primary) {
+                return Err(ConfigError::Load(
+                    "PRIMARY_OWNER_EMAIL must be one of GOOGLE_ALLOWED_EMAILS".to_string(),
+                ));
+            }
+        } else if !self.host_is_loopback() && !self.allow_unauthenticated {
+            return Err(ConfigError::Load(
+                "AUTH_ENABLED=false on a non-loopback bind requires ALLOW_UNAUTHENTICATED=true"
+                    .to_string(),
+            ));
+        }
+
+        if !(1..=5_000).contains(&self.data_load_max_identifiers) {
+            return Err(ConfigError::Load(format!(
+                "DATA_LOAD_MAX_IDENTIFIERS must be in 1..=5000 (got {})",
+                self.data_load_max_identifiers
+            )));
+        }
+        if !(1..=36_500).contains(&self.data_load_max_range_days) {
+            return Err(ConfigError::Load(format!(
+                "DATA_LOAD_MAX_RANGE_DAYS must be in 1..=36500 (got {})",
+                self.data_load_max_range_days
+            )));
+        }
+        if !(1..=10_000_000).contains(&self.data_load_max_identifier_days) {
+            return Err(ConfigError::Load(format!(
+                "DATA_LOAD_MAX_IDENTIFIER_DAYS must be in 1..=10000000 (got {})",
+                self.data_load_max_identifier_days
+            )));
+        }
+        if !(1..=32).contains(&self.data_load_max_concurrency) {
+            return Err(ConfigError::Load(format!(
+                "DATA_LOAD_MAX_CONCURRENCY must be in 1..=32 (got {})",
+                self.data_load_max_concurrency
+            )));
+        }
+        if !(1..=600).contains(&self.data_load_starts_per_minute) {
+            return Err(ConfigError::Load(format!(
+                "DATA_LOAD_STARTS_PER_MINUTE must be in 1..=600 (got {})",
+                self.data_load_starts_per_minute
+            )));
+        }
+        if !(1..=64).contains(&self.market_data_provider_max_concurrency) {
+            return Err(ConfigError::Load(format!(
+                "MARKET_DATA_PROVIDER_MAX_CONCURRENCY must be in 1..=64 (got {})",
+                self.market_data_provider_max_concurrency
+            )));
+        }
+        if !(1..=10).contains(&self.market_data_provider_max_retries) {
+            return Err(ConfigError::Load(format!(
+                "MARKET_DATA_PROVIDER_MAX_RETRIES must be in 1..=10 (got {})",
+                self.market_data_provider_max_retries
+            )));
+        }
+        if !(1..=300).contains(&self.market_data_provider_max_backoff_seconds) {
+            return Err(ConfigError::Load(format!(
+                "MARKET_DATA_PROVIDER_MAX_BACKOFF_SECONDS must be in 1..=300 (got {})",
+                self.market_data_provider_max_backoff_seconds
+            )));
+        }
+        for (name, value) in [
+            (
+                "AUTOMATION_RUN_RETENTION_DAYS",
+                self.automation_run_retention_days,
+            ),
+            (
+                "AUTOMATION_AUDIT_RETENTION_DAYS",
+                self.automation_audit_retention_days,
+            ),
+            (
+                "MORPHEUS_CONVERSATION_RETENTION_DAYS",
+                self.morpheus_conversation_retention_days,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Load(format!("{name} must be > 0")));
+            }
+        }
+        if self.maintenance_interval_seconds == 0 {
+            return Err(ConfigError::Load(
+                "MAINTENANCE_INTERVAL_SECONDS must be > 0".to_string(),
+            ));
         }
         // Length-validate the optional API key per spec's v1 contract.
         if !self.yahoo_finance_api_key.is_empty() {
@@ -511,6 +668,25 @@ impl AppConfig {
         self.validate_automation()?;
         self.validate_morpheus()?;
         Ok(())
+    }
+
+    /// Parsed, lower-cased Google allowlist.
+    pub fn google_allowlist(&self) -> Vec<String> {
+        self.google_allowed_emails
+            .split(',')
+            .map(|email| email.trim().to_lowercase())
+            .filter(|email| !email.is_empty())
+            .collect()
+    }
+
+    /// Whether the configured bind address is loopback-only.
+    fn host_is_loopback(&self) -> bool {
+        let host = self.host.trim();
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
     }
 
     /// Fail-fast validation for the spec-032 Morpheus keys.
@@ -748,16 +924,10 @@ impl AppConfig {
                 "OBO_TEMPORAL_INGEST_MAX_QUEUE must be >= 1".to_string(),
             ));
         }
-        if self.temporal_partition_ahead_months > 120 {
+        if !(1..=24).contains(&self.temporal_partition_ahead_months) {
             return Err(ConfigError::Load(format!(
-                "OBO_TEMPORAL_PARTITION_AHEAD_MONTHS must be <= 120 (got {})",
+                "OBO_TEMPORAL_PARTITION_AHEAD_MONTHS must be in 1..=24 (got {})",
                 self.temporal_partition_ahead_months
-            )));
-        }
-        if self.temporal_retention_archive_days < self.temporal_retention_intraday_days {
-            return Err(ConfigError::Load(format!(
-                "OBO_TEMPORAL_RETENTION_ARCHIVE_DAYS ({}) must be >= OBO_TEMPORAL_RETENTION_INTRADAY_DAYS ({})",
-                self.temporal_retention_archive_days, self.temporal_retention_intraday_days
             )));
         }
         if !matches!(
@@ -795,6 +965,22 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Minimal email-shape check for the allowlist; Google is the real verifier.
+fn is_valid_email(email: &str) -> bool {
+    let email = email.trim();
+    if email.is_empty() || email.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+}
+
 #[cfg(test)]
 mod tests {
     use envconfig::Envconfig;
@@ -803,7 +989,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn map() -> HashMap<String, String> {
-        HashMap::new()
+        HashMap::from([
+            ("AUTH_ENABLED".to_string(), "false".to_string()),
+            ("RUN_SCHEDULED_TASKS".to_string(), "false".to_string()),
+        ])
     }
 
     #[test]
@@ -874,6 +1063,9 @@ mod tests {
         let mut with_secret = config.clone();
         with_secret.auth_enabled = true;
         with_secret.jwt_secret = "s3cret".to_string();
+        with_secret.google_client_id = "client.apps.googleusercontent.com".to_string();
+        with_secret.google_allowed_emails = "a@example.com, b@example.com".to_string();
+        with_secret.primary_owner_email = "a@example.com".to_string();
         assert_eq!(with_secret.validate(), Ok(()));
     }
 
@@ -928,6 +1120,58 @@ mod tests {
     }
 
     #[test]
+    fn auth_allowlist_and_primary_owner_are_validated() {
+        let mut config = AppConfig {
+            auth_enabled: true,
+            jwt_secret: "secret".to_string(),
+            google_client_id: "client.apps.googleusercontent.com".to_string(),
+            google_allowed_emails: "a@example.com".to_string(),
+            primary_owner_email: "a@example.com".to_string(),
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_err(), "one account is not enough");
+
+        config.google_allowed_emails = "a@example.com,b@example.com".to_string();
+        assert_eq!(config.validate(), Ok(()));
+
+        config.primary_owner_email = "c@example.com".to_string();
+        assert!(config.validate().is_err(), "primary must be allowlisted");
+    }
+
+    #[test]
+    fn unauthenticated_non_loopback_bind_requires_override() {
+        let mut config = AppConfig {
+            host: "0.0.0.0".to_string(),
+            auth_enabled: false,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+        config.allow_unauthenticated = true;
+        assert_eq!(config.validate(), Ok(()));
+        config.host = "127.0.0.1".to_string();
+        config.allow_unauthenticated = false;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn load_and_provider_limits_are_bounded() {
+        let mut config = AppConfig {
+            data_load_max_identifiers: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+        config.data_load_max_identifiers = 500;
+        config.data_load_max_concurrency = 33;
+        assert!(config.validate().is_err());
+        config.data_load_max_concurrency = 32;
+        config.market_data_provider_max_retries = 0;
+        assert!(config.validate().is_err());
+        config.market_data_provider_max_retries = 3;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
     fn temporal_defaults_match_the_contract() {
         let config = AppConfig::init_from_hashmap(&map()).unwrap();
         assert_eq!(config.temporal_future_tolerance_seconds, 300);
@@ -935,8 +1179,6 @@ mod tests {
         assert_eq!(config.temporal_ingest_concurrency, 4);
         assert_eq!(config.temporal_ingest_max_queue, 10_000);
         assert_eq!(config.temporal_partition_ahead_months, 2);
-        assert_eq!(config.temporal_retention_intraday_days, 90);
-        assert_eq!(config.temporal_retention_archive_days, 365);
         assert_eq!(config.temporal_price_source_policy, "priority");
         config.validate_temporal().expect("defaults are valid");
     }
@@ -956,11 +1198,6 @@ mod tests {
         let mut zero_queue = base.clone();
         zero_queue.temporal_ingest_max_queue = 0;
         assert!(zero_queue.validate_temporal().is_err());
-
-        let mut inverted = base.clone();
-        inverted.temporal_retention_intraday_days = 400;
-        inverted.temporal_retention_archive_days = 90;
-        assert!(inverted.validate_temporal().is_err());
 
         let mut bad_policy = base.clone();
         bad_policy.temporal_price_source_policy = "loudest".to_string();

@@ -1,7 +1,7 @@
 //! Run message and log routes.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use obolargus_core::automation::runtime::persistence;
 
 use super::{ApiResult, api_error, map_error, require_enabled, require_pool};
 use crate::AppState;
+use crate::auth::AuthUser;
 
 /// Message list query.
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
@@ -88,12 +89,13 @@ pub struct MessageList {
 )]
 pub async fn list_messages(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(run_id): Path<Uuid>,
     Query(query): Query<MessageQuery>,
 ) -> ApiResult<MessageList> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::get_run(pool, run_id)
+    persistence::get_owned_run(pool, &auth.owner_id, run_id)
         .await
         .map_err(map_error)?;
     let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
@@ -173,12 +175,13 @@ pub struct LogList {
 )]
 pub async fn list_logs(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(run_id): Path<Uuid>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<LogList> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::get_run(pool, run_id)
+    persistence::get_owned_run(pool, &auth.owner_id, run_id)
         .await
         .map_err(map_error)?;
     let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
@@ -196,10 +199,14 @@ pub async fn list_logs(
     }))
 }
 
-/// Ensures a run exists, returning the contract 404 otherwise.
-pub async fn ensure_run(state: &AppState, run_id: Uuid) -> Result<(), super::ApiError> {
+/// Ensures an owned run exists, returning the contract 404 otherwise.
+pub async fn ensure_run(
+    state: &AppState,
+    owner_id: &str,
+    run_id: Uuid,
+) -> Result<(), super::ApiError> {
     let pool = require_pool(state)?;
-    persistence::get_run(pool, run_id)
+    persistence::get_owned_run(pool, owner_id, run_id)
         .await
         .map(|_| ())
         .map_err(|_| api_error(StatusCode::NOT_FOUND, "not_found", format!("run {run_id}")))

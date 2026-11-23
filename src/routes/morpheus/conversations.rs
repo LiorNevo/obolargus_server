@@ -1,7 +1,7 @@
 //! Conversation create, list, detail, rename, delete, and pagination routes.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -11,10 +11,11 @@ use obolargus_core::morpheus::error::MorpheusError;
 use obolargus_core::morpheus::persistence;
 
 use super::{
-    ApiError, ApiResult, ConversationSummaryView, MessageView, TurnSummaryView, actor,
+    ApiError, ApiResult, ConversationSummaryView, MessageView, TurnSummaryView,
     conversation_summary, require_enabled, require_pool,
 };
 use crate::AppState;
+use crate::auth::AuthUser;
 
 /// Create-conversation body.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -108,11 +109,12 @@ pub struct RenameRequest {
 )]
 pub async fn create_conversation(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Json(body): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<ConversationSummaryView>), ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let owner = actor(&state);
+    let owner = &auth.owner_id;
     match persistence::get_conversation_by_client(&pool, owner, body.client_conversation_id).await {
         Ok(existing) => Ok((StatusCode::OK, Json(conversation_summary(&existing)))),
         Err(MorpheusError::NotFound(_)) => {
@@ -134,6 +136,7 @@ pub async fn create_conversation(
 )]
 pub async fn list_conversations(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Query(query): Query<ListQuery>,
 ) -> ApiResult<ConversationPage> {
     require_enabled(&state)?;
@@ -141,7 +144,7 @@ pub async fn list_conversations(
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
     let (items, total) =
-        persistence::list_conversations(&pool, actor(&state), limit, offset).await?;
+        persistence::list_conversations(&pool, &auth.owner_id, limit, offset).await?;
     Ok(Json(ConversationPage {
         items: items.into_iter().map(Into::into).collect(),
         total,
@@ -160,13 +163,14 @@ pub async fn list_conversations(
 )]
 pub async fn get_conversation(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(conversation_id): Path<Uuid>,
     Query(query): Query<DetailQuery>,
 ) -> ApiResult<ConversationDetail> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let owner = actor(&state);
-    let conversation = persistence::get_conversation(&pool, owner, conversation_id).await?;
+    let conversation =
+        persistence::get_conversation(&pool, &auth.owner_id, conversation_id).await?;
     let limit = query.message_limit.unwrap_or(100).clamp(1, 200);
     let (messages, has_more) = persistence::list_messages(&pool, conversation_id, limit).await?;
     let turns = persistence::list_turns(&pool, conversation_id).await?;
@@ -200,12 +204,13 @@ pub async fn get_conversation(
 )]
 pub async fn list_messages(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(conversation_id): Path<Uuid>,
     Query(query): Query<BeforeQuery>,
 ) -> ApiResult<MessagePage> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::get_conversation(&pool, actor(&state), conversation_id).await?;
+    persistence::get_conversation(&pool, &auth.owner_id, conversation_id).await?;
     let before = persistence::get_message(&pool, conversation_id, query.before)
         .await?
         .seq;
@@ -229,6 +234,7 @@ pub async fn list_messages(
 )]
 pub async fn rename_conversation(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(conversation_id): Path<Uuid>,
     Json(body): Json<RenameRequest>,
 ) -> ApiResult<ConversationSummaryView> {
@@ -239,7 +245,7 @@ pub async fn rename_conversation(
         return Err(MorpheusError::validation("Title must be 1–120 characters.").into());
     }
     let record =
-        persistence::rename_conversation(&pool, actor(&state), conversation_id, title).await?;
+        persistence::rename_conversation(&pool, &auth.owner_id, conversation_id, title).await?;
     Ok(Json(conversation_summary(&record)))
 }
 
@@ -253,10 +259,11 @@ pub async fn rename_conversation(
 )]
 pub async fn delete_conversation(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(conversation_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    persistence::delete_conversation(&pool, actor(&state), conversation_id).await?;
+    persistence::delete_conversation(&pool, &auth.owner_id, conversation_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

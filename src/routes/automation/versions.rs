@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
@@ -20,6 +20,7 @@ use super::{
     require_pool,
 };
 use crate::AppState;
+use crate::auth::AuthUser;
 use crate::automation::audit;
 
 /// Version list item.
@@ -97,6 +98,7 @@ pub struct PublishRequest {
 )]
 pub async fn publish(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Json(body): Json<PublishRequest>,
 ) -> Result<(StatusCode, Json<VersionDetail>), super::ApiError> {
@@ -109,7 +111,7 @@ pub async fn publish(
             "version.change_note_required",
         ));
     }
-    let (_, draft) = persistence::get_flow(pool, flow_id)
+    let (_, draft) = persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
         .await
         .map_err(map_error)?;
     let Some(draft) = draft else {
@@ -141,13 +143,14 @@ pub async fn publish(
         flow_id,
         body.expected_revision,
         &body.change_note,
-        &state.config.automation_actor_id,
+        &auth.owner_id,
     )
     .await
     .map_err(map_error)?;
-    reconcile_inject_triggers(&state, flow_id, &version).await;
+    reconcile_inject_triggers(&state, &auth.owner_id, flow_id, &version).await;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "version.publish",
         "version",
         version.id,
@@ -171,7 +174,12 @@ pub async fn publish(
     ))
 }
 
-async fn reconcile_inject_triggers(state: &AppState, flow_id: Uuid, version: &FlowVersionRecord) {
+async fn reconcile_inject_triggers(
+    state: &AppState,
+    actor_id: &str,
+    flow_id: Uuid,
+    version: &FlowVersionRecord,
+) {
     let Some(pool) = state.pool.as_ref() else {
         return;
     };
@@ -240,7 +248,7 @@ async fn reconcile_inject_triggers(state: &AppState, flow_id: Uuid, version: &Fl
             cron_expression.as_deref(),
             zone,
             next,
-            &state.config.automation_actor_id,
+            actor_id,
         )
         .await;
     }
@@ -256,11 +264,15 @@ async fn reconcile_inject_triggers(state: &AppState, flow_id: Uuid, version: &Fl
 )]
 pub async fn list_versions(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> ApiResult<Page<VersionSummary>> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let (limit, offset) = pagination.bounds();
     let versions = persistence::list_versions(pool, flow_id, limit, offset)
         .await
@@ -285,10 +297,14 @@ pub async fn list_versions(
 )]
 pub async fn get_version(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path((flow_id, version_number)): Path<(Uuid, i32)>,
 ) -> ApiResult<VersionDetail> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let version = persistence::get_version(pool, flow_id, version_number)
         .await
         .map_err(map_error)?;
@@ -321,15 +337,20 @@ pub async fn get_version(
 )]
 pub async fn archive_version(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path((flow_id, version_number)): Path<(Uuid, i32)>,
 ) -> ApiResult<VersionSummary> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let version = persistence::archive_version(pool, flow_id, version_number)
         .await
         .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "version.archive",
         "version",
         version.id,
@@ -354,17 +375,18 @@ pub async fn archive_version(
 )]
 pub async fn export_version(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path((flow_id, version_number)): Path<(Uuid, i32)>,
 ) -> Result<Response, super::ApiError> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
+    let (flow, _) = persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
+        .await
+        .map_err(map_error)?;
     let version = persistence::get_version(pool, flow_id, version_number)
         .await
         .map_err(map_error)?;
     let body = serde_json::to_vec_pretty(&version.flow_json).unwrap_or_default();
-    let (flow, _) = persistence::get_flow(pool, flow_id)
-        .await
-        .map_err(map_error)?;
     let filename = format!("{}-v{}.json", sanitize_filename(&flow.name), version_number);
     let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(
@@ -444,12 +466,13 @@ pub struct ImportResponse {
 )]
 pub async fn import_flow(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Path(flow_id): Path<Uuid>,
     Json(body): Json<ImportRequest>,
 ) -> ApiResult<ImportResponse> {
     require_enabled(&state)?;
     let pool = require_pool(&state)?;
-    let (_, existing_draft) = persistence::get_flow(pool, flow_id)
+    let (_, existing_draft) = persistence::get_owned_flow(pool, &auth.owner_id, flow_id)
         .await
         .map_err(map_error)?;
     if existing_draft.is_some() && !body.replace_draft {
@@ -518,17 +541,12 @@ pub async fn import_flow(
     }
     let report = validate_flow(&document, &state.automation.registry);
     let flow_json = serde_json::to_value(&document).unwrap_or(Value::Null);
-    let saved = persistence::upsert_draft(
-        pool,
-        flow_id,
-        None,
-        &flow_json,
-        &state.config.automation_actor_id,
-    )
-    .await
-    .map_err(map_error)?;
+    let saved = persistence::upsert_draft(pool, flow_id, None, &flow_json, &auth.owner_id)
+        .await
+        .map_err(map_error)?;
     audit::record_best_effort(
         &state,
+        &auth.owner_id,
         "flow.import",
         "flow",
         flow_id,

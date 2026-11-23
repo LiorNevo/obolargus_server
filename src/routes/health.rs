@@ -29,6 +29,7 @@ pub struct HealthResponse {
     summary = "Service health check",
     description = "Reports service status and, when a database is configured, \
                    whether the database is reachable.",
+    security(()),
     responses(
         (status = 200, description = "The service is healthy", body = HealthResponse)
     )
