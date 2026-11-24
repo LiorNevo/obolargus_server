@@ -28,6 +28,7 @@ async fn login_issues_tokens_and_refresh_returns_a_new_access_token() {
     assert_eq!(body["token_type"], "Bearer");
     assert_eq!(body["expires_in"], 900);
     assert_eq!(body["actor"]["email"], ALICE);
+    assert_eq!(body["actor"]["is_primary_owner"], true);
     let actor_id = body["actor"]["id"].as_str().expect("actor id").to_string();
     assert!(uuid::Uuid::parse_str(&actor_id).is_ok());
     let access = body["access_token"].as_str().expect("access").to_string();

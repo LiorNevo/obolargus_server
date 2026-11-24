@@ -3,6 +3,7 @@
 pub mod assets;
 pub mod auth;
 pub mod automation;
+pub mod calendar;
 pub mod data_load;
 pub mod domain;
 pub mod health;

@@ -30,6 +30,23 @@ fn history_load_documents_the_request_and_report_schemas() {
     assert!(request.is_object());
     let response = &operation["responses"]["200"]["content"]["application/json"]["schema"];
     assert!(response.is_object());
+    let report = &document["components"]["schemas"]["HistoryLoadReport"]["properties"];
+    for field in [
+        "expected_sessions",
+        "closed_sessions",
+        "unexpected_sessions",
+        "calendar_mic",
+    ] {
+        assert!(
+            report[field].is_object(),
+            "missing HistoryLoadReport.{field}"
+        );
+    }
+    let refresh = &document["components"]["schemas"]["RefreshResponse"]["properties"];
+    assert!(
+        refresh["latest_completed_session"].is_object(),
+        "missing RefreshResponse.latest_completed_session"
+    );
 }
 
 use axum::Json;

@@ -20,7 +20,7 @@ use utoipa::ToSchema;
 
 use crate::AppState;
 use crate::auth::rate_limit::retry_after_seconds;
-use crate::auth::{LoginError, RefreshError};
+use crate::auth::{AuthUser, LoginError, RefreshError};
 use crate::routes::ErrorEnvelope;
 
 /// Client address used as the sign-in rate-limit key.
@@ -75,6 +75,8 @@ pub struct ActorView {
     pub id: String,
     /// Verified Google email.
     pub email: String,
+    /// Whether this actor may change shared reference data.
+    pub is_primary_owner: bool,
 }
 
 /// Sign-in response body.
@@ -223,6 +225,8 @@ pub async fn login(
                 .auth
                 .issue_tokens(&actor)
                 .map_err(|_| AuthApiError::Unavailable)?;
+            let user = AuthUser::from_actor(&actor);
+            let is_primary_owner = state.auth.is_primary_owner(&user);
             Ok(Json(LoginResponse {
                 access_token: tokens.access_token,
                 refresh_token: tokens.refresh_token,
@@ -231,6 +235,7 @@ pub async fn login(
                 actor: ActorView {
                     id: actor.id.to_string(),
                     email: actor.email,
+                    is_primary_owner,
                 },
             }))
         }

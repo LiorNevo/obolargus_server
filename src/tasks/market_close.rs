@@ -24,6 +24,7 @@ pub async fn run(
             assets_no_op: 0,
             assets_missing_identifier: 0,
             assets_source_unavailable: 0,
+            latest_completed_session: None,
         });
     };
     run_refresh(

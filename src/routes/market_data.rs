@@ -236,6 +236,8 @@ pub struct RefreshResponse {
     pub assets_missing_identifier: i64,
     /// Source-unavailable assets.
     pub assets_source_unavailable: i64,
+    /// Latest completed session resolved for the requested asset.
+    pub latest_completed_session: Option<chrono::NaiveDate>,
 }
 
 #[utoipa::path(
@@ -284,6 +286,7 @@ pub async fn refresh(
         assets_no_op: summary.assets_no_op,
         assets_missing_identifier: summary.assets_missing_identifier,
         assets_source_unavailable: summary.assets_source_unavailable,
+        latest_completed_session: summary.latest_completed_session,
     }))
 }
 

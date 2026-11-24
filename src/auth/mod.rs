@@ -393,6 +393,12 @@ impl AuthState {
     pub fn primary_actor(&self) -> Option<actor::ActorRecord> {
         self.actors.by_email(&self.settings.primary_owner_email)
     }
+
+    /// Whether `user` may change shared reference data. Authentication being
+    /// disabled makes the local actor the owner.
+    pub fn is_primary_owner(&self, user: &AuthUser) -> bool {
+        !self.settings.enabled || normalize_email(&user.email) == self.settings.primary_owner_email
+    }
 }
 
 /// Tokens returned by a successful sign-in.
@@ -651,5 +657,38 @@ mod tests {
         let user = AuthUser::dev();
         assert_eq!(user.actor_id, DEV_USER_ID);
         assert_eq!(user.owner_id, DEV_USER_ID);
+        assert!(AuthState::dev().is_primary_owner(&user));
+    }
+
+    #[test]
+    fn only_the_configured_email_is_the_primary_owner() {
+        let verifier: Arc<dyn GoogleVerifier> = Arc::new(JwksVerifier::new(""));
+        let auth = AuthState::new_in_memory(
+            AuthSettings {
+                enabled: true,
+                google_client_id: "test-client".to_string(),
+                allowed_emails: ["alice@example.com", "bob@example.com"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                primary_owner_email: "alice@example.com".to_string(),
+                jwt_secret: "test-secret".to_string(),
+                access_ttl_minutes: 15,
+                refresh_ttl_days: 7,
+            },
+            verifier,
+        );
+        let owner = AuthUser {
+            actor_id: "a".into(),
+            owner_id: "a".into(),
+            email: "Alice@Example.com".into(),
+        };
+        let reader = AuthUser {
+            actor_id: "b".into(),
+            owner_id: "b".into(),
+            email: "bob@example.com".into(),
+        };
+        assert!(auth.is_primary_owner(&owner));
+        assert!(!auth.is_primary_owner(&reader));
     }
 }

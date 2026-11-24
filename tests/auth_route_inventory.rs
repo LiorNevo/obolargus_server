@@ -196,3 +196,42 @@ async fn the_document_declares_bearer_security_globally() {
         );
     }
 }
+
+#[tokio::test]
+async fn calendar_writes_require_the_primary_owner() {
+    let harness = auth::auth_harness();
+    let reader = auth::seed_actor(&harness.auth, common::auth::BOB, Some("google-bob"));
+    let token = auth::access_token(&harness.auth, &reader);
+    let response = auth::send(
+        &harness.state,
+        Method::POST,
+        "/api/market-data/calendar-assignments",
+        Some(json!({
+            "asset_id": "00000000-0000-4000-8000-000000000000",
+            "mic": "XNAS",
+            "valid_from": "2026-01-01",
+            "valid_to": null
+        })),
+        Some(&token),
+    )
+    .await;
+    let response = auth::assert_status(response, StatusCode::FORBIDDEN);
+    assert_eq!(
+        auth::json(response).await["error"]["code"],
+        "primary_owner_required"
+    );
+
+    let owner = auth::seed_actor(&harness.auth, ALICE, Some("google-alice"));
+    let token = auth::access_token(&harness.auth, &owner);
+    let response = auth::send(
+        &harness.state,
+        Method::GET,
+        "/api/market-data/calendars",
+        None,
+        Some(&token),
+    )
+    .await;
+    // No database is configured in the auth harness: the owner reaches the
+    // handler and gets the explicit unavailable state, not 401/403.
+    auth::assert_status(response, StatusCode::SERVICE_UNAVAILABLE);
+}

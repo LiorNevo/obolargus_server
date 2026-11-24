@@ -27,6 +27,15 @@ const EXPECTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/api/market-data/load-range"),
     ("post", "/api/market-data/load-range/async"),
     ("post", "/api/market-data/history-load"),
+    ("get", "/api/market-data/assets/{asset_id}/coverage"),
+    ("get", "/api/market-data/calendars"),
+    ("get", "/api/market-data/calendars/{mic}"),
+    ("get", "/api/market-data/calendars/{mic}/export"),
+    ("put", "/api/market-data/calendars/{mic}"),
+    ("post", "/api/market-data/calendars/{mic}/retire"),
+    ("get", "/api/market-data/calendar-assignments"),
+    ("post", "/api/market-data/calendar-assignments"),
+    ("delete", "/api/market-data/calendar-assignments/{id}"),
     ("get", "/api/data-load/domains"),
     ("get", "/api/data-load/sources"),
     ("get", "/api/data-load/identifier-search"),
@@ -527,6 +536,49 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                 (["200"].into_iter().collect(), "200")
             }
             ("get", "/api/market-data/lookup") => (["200", "400"].into_iter().collect(), "200"),
+            ("get", "/api/market-data/assets/{asset_id}/coverage") => (
+                ["200", "400", "401", "404", "500", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
+            ("get", "/api/market-data/calendars") => {
+                (["200", "401", "500", "503"].into_iter().collect(), "200")
+            }
+            (
+                "get",
+                "/api/market-data/calendars/{mic}" | "/api/market-data/calendars/{mic}/export",
+            ) => (
+                ["200", "401", "404", "500", "503"].into_iter().collect(),
+                "200",
+            ),
+            ("put", "/api/market-data/calendars/{mic}") => (
+                ["200", "401", "403", "409", "422", "500", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
+            ("post", "/api/market-data/calendars/{mic}/retire") => (
+                ["200", "401", "403", "404", "409", "500", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
+            ("get", "/api/market-data/calendar-assignments") => {
+                (["200", "401", "500", "503"].into_iter().collect(), "200")
+            }
+            ("post", "/api/market-data/calendar-assignments") => (
+                ["200", "401", "403", "404", "409", "422", "500", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
+            ("delete", "/api/market-data/calendar-assignments/{id}") => (
+                ["200", "401", "403", "404", "500", "503"]
+                    .into_iter()
+                    .collect(),
+                "200",
+            ),
             ("post", "/api/market-data/load-range") => (
                 [
                     "200", "400", "401", "409", "415", "422", "429", "500", "502", "503",
@@ -572,6 +624,19 @@ fn operations_carry_tags_summaries_and_documented_statuses() {
                     "post",
                     "/api/market-data/load-range" | "/api/market-data/load-range/async",
                     "400" | "409" | "429"
+                ) | (
+                    "get",
+                    "/api/market-data/assets/{asset_id}/coverage",
+                    "400" | "401" | "404" | "500" | "503"
+                ) | (
+                    "get" | "put" | "post" | "delete",
+                    "/api/market-data/calendars"
+                        | "/api/market-data/calendars/{mic}"
+                        | "/api/market-data/calendars/{mic}/export"
+                        | "/api/market-data/calendars/{mic}/retire"
+                        | "/api/market-data/calendar-assignments"
+                        | "/api/market-data/calendar-assignments/{id}",
+                    "400" | "401" | "403" | "404" | "409" | "422" | "500" | "503",
                 )
             );
             if structured {
@@ -665,6 +730,7 @@ fn document_contains_the_expected_schemas_and_shapes() {
         "no_op",
         "not_resolved",
         "no_data_for_date",
+        "calendar_closed",
         "unsupported_scheme",
         "rejected",
         "source_unavailable",
