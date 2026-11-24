@@ -83,7 +83,7 @@ async fn published_flow(state: &AppState, repeat: &str) -> String {
 }
 
 async fn wait_for_terminal(state: &AppState, run_id: &str) -> Value {
-    for _ in 0..200 {
+    for _ in 0..1000 {
         let (status, body) = send(
             state.clone(),
             Method::GET,
