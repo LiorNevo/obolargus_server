@@ -48,7 +48,7 @@ use obolargus_core::market_data::load_range::{
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconciliationPolicy, run_reconcile,
 };
-use obolargus_core::market_data::refresh::{RefreshConfig, run_refresh};
+use obolargus_core::market_data::refresh::{RefreshConfig, run_refresh_including_current};
 use obolargus_core::market_data::registry::SourceDescriptor;
 use obolargus_core::market_data::types::{TickerLookupRequest, TypedIdentifier};
 
@@ -269,7 +269,7 @@ pub async fn refresh(
         )
     })?;
     let asset_id = obolargus_core::domain::id::AssetId::from_uuid(body.asset_id);
-    let summary = run_refresh(
+    let summary = run_refresh_including_current(
         pool,
         &state.market_data,
         RefreshConfig {

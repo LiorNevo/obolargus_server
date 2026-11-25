@@ -3,7 +3,7 @@
 //! Implements US4 / FR-030..FR-032 of `specs/017-yahoo-data-source/spec.md`.
 
 use obolargus_core::market_data::error::MarketDataProviderError;
-use obolargus_core::market_data::refresh::{RefreshConfig, run_refresh};
+use obolargus_core::market_data::refresh::{RefreshConfig, run_refresh_including_current};
 
 use crate::AppState;
 
@@ -27,7 +27,7 @@ pub async fn run(
             latest_completed_session: None,
         });
     };
-    run_refresh(
+    run_refresh_including_current(
         pool,
         &state.market_data,
         RefreshConfig {
