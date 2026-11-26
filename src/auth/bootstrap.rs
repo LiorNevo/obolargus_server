@@ -39,12 +39,11 @@ impl From<sqlx::Error> for BootstrapError {
 
 /// An ownership table and the statement that reassigns legacy owners to the
 /// primary actor. The table names are internal constants, never user input.
+///
+/// `automation_flows` is handled separately because its `(owner_id, lower(name))`
+/// unique index can collide with an existing primary-owner flow of the same
+/// name while legacy data is being reassigned.
 const REASSIGN_STATEMENTS: &[(&str, &str)] = &[
-    (
-        "automation_flows",
-        "UPDATE automation_flows SET owner_id = $1
-         WHERE owner_id IS NULL OR owner_id = 'dev-user'",
-    ),
     (
         "automation_context",
         "UPDATE automation_context SET owner_id = $1
@@ -67,6 +66,56 @@ const REASSIGN_STATEMENTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Reassigns legacy automation flows, renaming only the flows whose names
+/// collide with a flow already owned by the primary actor.
+///
+/// The unique index is on `(owner_id, lower(name))`. A plain bulk update can
+/// violate it when both owners have a flow named the same. Colliding legacy
+/// flows get a stable `(legacy <id>)` suffix instead of being deleted.
+async fn reassign_legacy_flows(pool: &PgPool, owner: &str) -> Result<u64, sqlx::Error> {
+    let legacy: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM automation_flows \
+         WHERE owner_id IS NULL OR owner_id = 'dev-user'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut reassigned = 0;
+    for (flow_id, name) in legacy {
+        let collides: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM automation_flows
+                WHERE owner_id = $1
+                  AND lower(name) = lower($2)
+                  AND id <> $3
+                  AND deleted_at IS NULL
+             )",
+        )
+        .bind(owner)
+        .bind(&name)
+        .bind(flow_id)
+        .fetch_one(pool)
+        .await?;
+
+        if collides {
+            let renamed = format!("{name} (legacy {flow_id})");
+            sqlx::query("UPDATE automation_flows SET name = $1 WHERE id = $2")
+                .bind(renamed)
+                .bind(flow_id)
+                .execute(pool)
+                .await?;
+        }
+
+        let result = sqlx::query("UPDATE automation_flows SET owner_id = $1 WHERE id = $2")
+            .bind(owner)
+            .bind(flow_id)
+            .execute(pool)
+            .await?;
+        reassigned += result.rows_affected();
+    }
+    Ok(reassigned)
+}
+
 /// Seeds the primary actor, backfills legacy ownership, and loads the cache.
 pub async fn run(pool: &PgPool, auth: &AuthState) -> Result<(), BootstrapError> {
     if auth.settings.enabled {
@@ -86,6 +135,15 @@ pub async fn run(pool: &PgPool, auth: &AuthState) -> Result<(), BootstrapError> 
         )
         .execute(pool)
         .await?;
+
+        let flows = reassign_legacy_flows(pool, &owner).await?;
+        if flows > 0 {
+            tracing::info!(
+                rows = flows,
+                owner_id = %owner,
+                "reassigned legacy automation flows"
+            );
+        }
 
         for (table, statement) in REASSIGN_STATEMENTS {
             let result = sqlx::query(sqlx::AssertSqlSafe(*statement))

@@ -80,3 +80,76 @@ async fn bootstrap_seeds_the_primary_actor_and_loads_the_cache() {
         .await
         .expect("cleanup");
 }
+
+#[tokio::test]
+async fn bootstrap_renames_colliding_legacy_flows_instead_of_failing() {
+    use obolargus_core::automation::runtime::persistence;
+    use serde_json::json;
+
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let primary_email = format!("collision-primary-{suffix}@example.com");
+    let config = AppConfig {
+        auth_enabled: true,
+        google_client_id: "test-client.apps.googleusercontent.com".to_string(),
+        google_allowed_emails: primary_email.clone(),
+        primary_owner_email: primary_email.clone(),
+        jwt_secret: "test-secret".to_string(),
+        ..AppConfig::default()
+    };
+    let auth = AuthState::from_config(&config, Some(pool.clone())).expect("auth state");
+    bootstrap::run(&pool, &auth)
+        .await
+        .expect("initial bootstrap");
+    let primary = auth.primary_actor().expect("primary actor");
+
+    let name = format!("Legacy collision {suffix}");
+    let document = json!({
+        "schema_version": 1,
+        "name": name,
+        "description": "",
+        "tags": [],
+        "inputs": [],
+        "nodes": [],
+        "wires": [],
+        "subflows": []
+    });
+    let primary_flow =
+        persistence::create_flow(&pool, &primary.id.to_string(), &name, "", &[], &document)
+            .await
+            .expect("primary flow");
+    let legacy_flow = persistence::create_flow(&pool, "dev-user", &name, "", &[], &document)
+        .await
+        .expect("legacy flow");
+
+    bootstrap::run(&pool, &auth)
+        .await
+        .expect("collision bootstrap must not violate the unique name index");
+
+    let (owner, renamed): (String, String) =
+        sqlx::query_as("SELECT owner_id, name FROM automation_flows WHERE id = $1")
+            .bind(legacy_flow.id)
+            .fetch_one(&pool)
+            .await
+            .expect("legacy flow row");
+    assert_eq!(owner, primary.id.to_string());
+    assert!(
+        renamed.contains("(legacy "),
+        "colliding legacy flow should be renamed, got {renamed}"
+    );
+
+    for flow_id in [primary_flow.id, legacy_flow.id] {
+        sqlx::query("DELETE FROM automation_flows WHERE id = $1")
+            .bind(flow_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup flow");
+    }
+    sqlx::query("DELETE FROM actors WHERE lower(email) = lower($1)")
+        .bind(&primary_email)
+        .execute(&pool)
+        .await
+        .expect("cleanup actor");
+}
